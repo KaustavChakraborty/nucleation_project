@@ -412,7 +412,7 @@ def main():
 
     # Final filename
     # Since cubic lattice  a = b = c
-    def choose_output_filename(output_gsd, lattice_type, phi, a):
+    def choose_output_filename(output_gsd, lattice_type, phi, n_actual, a):
         if output_gsd is not None and str(output_gsd).strip():
             return str(output_gsd)
 
@@ -420,15 +420,14 @@ def main():
         a_str = fmt(a)
         return (
             f"hard_sphere_lattice_{lattice_type}"
-            f"_pf{phi_str}"
+            f"_pf{phi_str}_{n_actual}"
             f"_lattice_const_{a_str}_{a_str}_{a_str}.gsd"
         )
 
     # Automatically generated output filename.
     # Example:
     # hard_sphere_lattice_FCC_pf0p5_lattice_const_1p61_1p61_1p61.gsd
-    output_gsd = choose_output_filename(output_gsd_from_json, lattice_type, phi, a)
-
+    output_gsd = choose_output_filename(output_gsd_from_json, lattice_type, phi, n_actual, a)
 
     # ---- Build positions ---------------------------------------------------
     positions = build_positions(lattice_type, a, nx, ny, nz)

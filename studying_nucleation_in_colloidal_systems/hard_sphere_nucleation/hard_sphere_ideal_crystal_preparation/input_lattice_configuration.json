@@ -1,8 +1,7 @@
 {
     "_comment": "Input for make_lattice_phi.py (Version 2 — packing fraction driven)",
-    "lattice_type"   : "FCC",
+    "lattice_type"   : "SC",
     "phi"            : 0.10,
     "diameter"       : 1.2407,
-    "n_particles_req": 2000,
-    "output_gsd"     : "lattice_phi.gsd"
+    "n_particles_req": 2197
 }
