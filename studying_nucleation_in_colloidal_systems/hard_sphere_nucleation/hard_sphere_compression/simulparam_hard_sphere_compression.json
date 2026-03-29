@@ -1,0 +1,41 @@
+{
+    "_section_io": "--- I/O identifiers ---",
+    "tag"                          : "hard_sphere_4096_compression_to_pf0p58",
+    "input_gsd_filename"           : "hard_sphere_lattice_SC_pf0p1_2197_lattice_const_2p15_2p15_2p15.gsd",
+
+    "_section_stage": "--- Stage control ---",
+    "_comment_stage": "stage_id_current: -1 = single-stage (use filenames below); 0,1,2,... = multi-stage",
+    "stage_id_current"             : -1,
+    "initial_timestep"             : 0,
+
+    "_section_physics": "--- Physical system ---",
+    "target_pf"                    : 0.58,
+
+    "_section_compression": "--- Manual compression loop parameters (v2 methodology) ---",
+    "_comment_vsf": "volume_scaling_factor: box volume is multiplied by this at each outer step (v2: 0.99)",
+    "volume_scaling_factor"        : 0.99,
+
+    "_comment_rl_overlap": "run_length_to_remove_overlap: HPMC steps per inner overlap-removal attempt",
+    "run_length_to_remove_overlap" : 1000,
+
+    "_comment_rl_relax": "run_length_to_relax: fixed-box HPMC steps after overlaps reach zero",
+    "run_length_to_relax"          : 500,
+
+    "_section_mc": "--- HPMC move parameters (FIXED — no adaptive tuner, matching v2) ---",
+    "_comment_mc": "move_size_translation: translational move size d; kept fixed throughout (v2 style)",
+    "move_size_translation"        : 0.04,
+
+    "_section_timing": "--- Output frequencies ---",
+    "restart_frequency"            : 10000,
+    "traj_out_freq"                : 100000,
+    "log_frequency"                : 100000,
+
+    "_section_hardware": "--- Hardware selection ---",
+    "use_gpu"                      : false,
+    "gpu_id"                       : 0,
+
+    "_section_filenames": "--- Output filenames (only used when stage_id_current == -1) ---",
+    "restart_gsd_filename"         : "hard_sphere_4096_compression_restart.gsd",
+    "output_gsd_traj_filename"     : "hard_sphere_4096_compression_traj.gsd",
+    "final_gsd_filename"           : "hard_sphere_4096_compression_final.gsd"
+}
