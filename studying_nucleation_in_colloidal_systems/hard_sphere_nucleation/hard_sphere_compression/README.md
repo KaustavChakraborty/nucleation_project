@@ -1,6 +1,6 @@
 # Hard-Sphere HPMC Compression - Comprehensive Documentation
 
-**Version:** 11 (Documented Edition)  
+**Version:** 12  
 **HOOMD-blue Version:** ≥ 4.0 (tested with 4.9.0)  
 **Author:** Kaustav Chakraborty  
 **Date:** 2025
@@ -3258,4 +3258,8 @@ At φ_target = 0.40: Use run_length_to_relax ≥ 1,000
 - Requires additional HOOMD features not used here
 
 ---
+
+
+
+
 

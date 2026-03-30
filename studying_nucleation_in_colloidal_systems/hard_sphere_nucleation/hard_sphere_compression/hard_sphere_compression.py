@@ -4,7 +4,7 @@
 # =============================================================================
 #
 # FILE: hard_sphere_compression_with_fixed_move_size.py
-# VERSION: 11
+# VERSION: 12
 # AUTHOR: Kaustav Chakraborty
 # DATE: 2025
 #
@@ -346,14 +346,6 @@ def _mpi_rank_from_env() -> int:
         - Rank 0 is designated the "root" rank for I/O operations.
         - In non-MPI runs (serial execution), this always returns 0.
         - Environment variables are checked in order of specificity.
-    
-    Examples:
-        >>> # In a 4-process MPI run on rank 2:
-        >>> _mpi_rank_from_env()
-        2
-        >>> # In a non-MPI run:
-        >>> _mpi_rank_from_env()
-        0
     """
 
     return int(
@@ -379,11 +371,6 @@ def _is_root_rank() -> bool:
     Usage:
         Used to guard I/O operations that should only be performed once
         across all MPI ranks:
-        
-        >>> if _is_root_rank():
-        >>>     print("This message appears once in MPI runs")
-        >>>     with open("output.txt", "w") as f:
-        >>>         f.write("Data")
     
     Notes:
         - All ranks execute the same code, but only rank 0 performs I/O.
@@ -554,12 +541,6 @@ class SimulationParams:
                 Build multi-frame trajectory for visualization and analysis.
                 Each frame captures particle positions, box dimensions, and
                 logged quantities (phi, overlaps, acceptance, etc.)
-            
-            Typical values: 100000 - 1000000
-            
-            Storage implications:
-                - Each frame: ~N * 12 bytes (3 floats per particle position)
-                - Example: 4096 particles, 100 frames → ~5 MB trajectory
             
             Notes:
                 - Mode "ab" (append binary): Restarts add to existing trajectory
@@ -791,9 +772,6 @@ def load_simulparams(json_path: str) -> SimulationParams:
         All errors are fatal (sys.exit). This is by design:
             - Parameter errors should be fixed before running, not ignored
     
-    Example usage:
-        >>> params = load_simulparams("simulparam.json")
-        >>> print(f"Target phi: {params.target_pf}")
     
     Notes:
         - Only rank 0 prints error messages (via sys.exit), but all ranks exit
@@ -1915,16 +1893,20 @@ def build_simulation(
             filename=files.traj_gsd,
             mode="ab",                # Append mode (restarts don't overwrite)
             filter=hoomd.filter.All(),  # Write all particles
-            dynamic=["property", "attribute"],  # Log dynamic quantities
+            dynamic=["property", "attribute"],  # Keep attributes dynamic across frames
             logger=gsd_logger,          # Attach logger
         )
+        # HOOMD v4+ does NOT write particles/diameter by default.
+        # Force diameter to be written to the trajectory GSD.
+        gsd_traj.write_diameter = True
         sim.operations.writers.append(gsd_traj)
         
         root_print(
             f"[BUILD] GSD trajectory writer attached:\n"
             f"        - File: {files.traj_gsd}\n"
             f"        - Frequency: every {params.traj_out_freq} timesteps\n"
-            f"        - Mode: append (restarts continue existing file)"
+            f"        - Mode: append (restarts continue existing file)\n"
+            f"        - particles/diameter: forced ON"
         )
     
     except Exception as traj_writer_error:
@@ -1946,15 +1928,19 @@ def build_simulation(
             mode="wb",                  # Write mode (overwrite each time)
             filter=hoomd.filter.All(),  # Write all particles
             truncate=True,              # Overwrite file (single-frame checkpoint)
-            dynamic=["property", "attribute"],  # Log dynamic quantities
+            dynamic=["property", "attribute"],  # Keep attributes dynamic across frames
         )
+        # HOOMD v4+ does NOT write particles/diameter by default.
+        # Force diameter to be written to the restart GSD.
+        gsd_restart.write_diameter = True
         sim.operations.writers.append(gsd_restart)
         
         root_print(
             f"[BUILD] GSD restart writer attached:\n"
             f"        - File: {files.restart_gsd}\n"
             f"        - Frequency: every {params.restart_frequency} timesteps\n"
-            f"        - Mode: truncate (single-frame checkpoint)"
+            f"        - Mode: truncate (single-frame checkpoint)\n"
+            f"        - particles/diameter: forced ON"
         )
     
     except Exception as restart_writer_error:
@@ -2360,8 +2346,12 @@ def run_compression(
             
             # Recalculate phi after equilibration (may have changed slightly)
             phi_after_relax = packing_fraction(N, diameter, sim.state.box)
-            phi_rounded = f"{phi_after_relax:.4f}"
+            phi_rounded_str = f"{phi_after_relax:.4f}"
 
+            # IMPORTANT: query mc.overlaps on *all* ranks before entering a
+            # rank-0-only block. In MPI, accessing this quantity only on rank 0
+            # can deadlock because it may require participation from all ranks.
+            overlaps_after_relax = mc.overlaps
 
             # Write current_pf.json (rank 0 only)
             # We add extra metadata for debugging
@@ -2373,7 +2363,7 @@ def run_compression(
                                 "current_pf":     phi_rounded_str,
                                 "outer_step":     outer_step,
                                 "timestep":       sim.timestep,
-                                "overlaps":       mc.overlaps,
+                                "overlaps":       overlaps_after_relax,
                                 "inner_iters":    inner_count,
                                 "box_volume":     sim.state.box.volume,
                                 "timestamp":      time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -2482,13 +2472,22 @@ def write_final_outputs(
     # v2: final_compressed_filename = tag + "_compressed_to_pf_" + pf_rounded + ".gsd"
     phi_rounded = f"{phi_final:.4f}".replace(".", "p")
     compressed_gsd = f"{params.tag}_compressed_to_pf_{phi_rounded}.gsd"
-    _write_snapshot(sim, compressed_gsd)
+    # Flush buffered writer data before reading / validating output files.
+    _flush_all_gsd_writers(sim)
+
+    # Write single-frame hard-sphere snapshots with diameter explicitly stored.
+    _write_snapshot_with_diameter(sim, compressed_gsd)
     root_print(f"[OUTPUT] Labelled snapshot => {compressed_gsd}")
 
-    # Canonical final state     
+    # Canonical final state
     # Standard filename for multi-stage chaining
-    _write_snapshot(sim, files.final_gsd)
+    _write_snapshot_with_diameter(sim, files.final_gsd)
     root_print(f"[OUTPUT] Final GSD         => {files.final_gsd}")
+
+    # Verify that all output GSD files contain the expected diameter.
+    _verify_gsd_diameter(files.traj_gsd, params.diameter, label="trajectory")
+    _verify_gsd_diameter(files.restart_gsd, params.diameter, label="restart")
+    _verify_gsd_diameter(files.final_gsd, params.diameter, label="final")
 
     # Machine-readable summary
     summary = {
@@ -2546,11 +2545,95 @@ def write_final_outputs(
     root_flush_stdout()
 
 
+def _flush_all_gsd_writers(sim: hoomd.Simulation) -> None:
+    """Flush all attached writers that support flush()."""
+    for writer in sim.operations.writers:
+        if hasattr(writer, "flush"):
+            writer.flush()
+
+
+def _write_snapshot_with_diameter(sim: hoomd.Simulation, filename: str) -> None:
+    """Write a single-frame hard-sphere GSD with particles/diameter explicitly stored."""
+    snap = sim.state.get_snapshot()
+
+    if not _is_root_rank():
+        return
+
+    frame = gsd.hoomd.Frame()
+    box = sim.state.box
+
+    # Configuration
+    frame.configuration.step = int(sim.timestep)
+    frame.configuration.box = [box.Lx, box.Ly, box.Lz, box.xy, box.xz, box.yz]
+
+    # Particle data required for later HOOMD input/restart use.
+    frame.particles.N = int(snap.particles.N)
+    frame.particles.position = np.asarray(snap.particles.position, dtype=np.float32)
+    frame.particles.typeid = np.asarray(snap.particles.typeid, dtype=np.uint32)
+    frame.particles.types = list(snap.particles.types)
+    frame.particles.diameter = np.asarray(snap.particles.diameter, dtype=np.float32)
+
+    # These fields are not strictly required for monodisperse hard spheres,
+    # but writing them preserves more of the state when they are available.
+    if getattr(snap.particles, "image", None) is not None:
+        frame.particles.image = np.asarray(snap.particles.image, dtype=np.int32)
+    if getattr(snap.particles, "orientation", None) is not None:
+        frame.particles.orientation = np.asarray(snap.particles.orientation, dtype=np.float32)
+    if getattr(snap.particles, "body", None) is not None:
+        frame.particles.body = np.asarray(snap.particles.body, dtype=np.int32)
+    if getattr(snap.particles, "mass", None) is not None:
+        frame.particles.mass = np.asarray(snap.particles.mass, dtype=np.float32)
+    if getattr(snap.particles, "charge", None) is not None:
+        frame.particles.charge = np.asarray(snap.particles.charge, dtype=np.float32)
+    if getattr(snap.particles, "moment_inertia", None) is not None:
+        frame.particles.moment_inertia = np.asarray(snap.particles.moment_inertia, dtype=np.float32)
+    if getattr(snap.particles, "velocity", None) is not None:
+        frame.particles.velocity = np.asarray(snap.particles.velocity, dtype=np.float32)
+    if getattr(snap.particles, "angmom", None) is not None:
+        frame.particles.angmom = np.asarray(snap.particles.angmom, dtype=np.float32)
+
+    with gsd.hoomd.open(name=filename, mode="w") as traj:
+        traj.append(frame)
+
+
 def _write_snapshot(sim: hoomd.Simulation, filename: str) -> None:
-    """Write current state to a single-frame GSD file."""
+    """Write a single-frame GSD checkpoint using HOOMD's built-in writer."""
     hoomd.write.GSD.write(
-        state=sim.state, filename=filename, mode="wb",
-        filter=hoomd.filter.All()
+        state=sim.state,
+        filename=filename,
+        mode="wb",
+        filter=hoomd.filter.All(),
+    )
+
+def _verify_gsd_diameter(filename: str, expected_diameter: float, label: str = "output") -> None:
+    """Read the last frame of a GSD and verify that particles/diameter is present and correct."""
+    if not _is_root_rank():
+        return
+
+    with gsd.hoomd.open(name=filename, mode="r") as traj:
+        if len(traj) == 0:
+            sys.exit(f"[FATAL ERROR] {label} GSD '{filename}' has no frames.")
+        frame = traj[-1]
+
+    diam = np.asarray(frame.particles.diameter, dtype=float)
+    if diam.size == 0:
+        sys.exit(f"[FATAL ERROR] {label} GSD '{filename}' does not contain particles/diameter.")
+
+    unique = np.unique(np.round(diam, decimals=12))
+    if unique.size != 1:
+        sys.exit(
+            f"[FATAL ERROR] {label} GSD '{filename}' contains multiple diameters: {unique.tolist()}"
+        )
+
+    d = float(unique[0])
+    if not np.isclose(d, float(expected_diameter), rtol=0.0, atol=1e-10):
+        sys.exit(
+            f"[FATAL ERROR] {label} GSD '{filename}' diameter mismatch: "
+            f"expected {expected_diameter}, found {d}"
+        )
+
+    root_print(
+        f"[VERIFY] {label.capitalize()} GSD diameter OK => file='{filename}' | diameter={d}"
     )
 
 
@@ -2842,3 +2925,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         root_print("="*80)
         sys.exit(1)
+

@@ -35,7 +35,7 @@
     "gpu_id"                       : 0,
 
     "_section_filenames": "--- Output filenames (only used when stage_id_current == -1) ---",
-    "restart_gsd_filename"         : "hard_sphere_4096_compression_restart.gsd",
-    "output_gsd_traj_filename"     : "hard_sphere_4096_compression_traj.gsd",
-    "final_gsd_filename"           : "hard_sphere_4096_compression_final.gsd"
+    "restart_gsd_filename"         : "hard_sphere_4096_compression_to_pf0p58_restart.gsd",
+    "output_gsd_traj_filename"     : "hard_sphere_4096_compression_to_pf0p58_traj.gsd",
+    "final_gsd_filename"           : "hard_sphere_4096_compression_to_pf0p58_final.gsd"
 }
