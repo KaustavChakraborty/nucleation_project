@@ -794,17 +794,6 @@ HOOMD provides **simulation execution**, but NOT **parameter sanity checking**.
 - Fraction of space occupied by particle cores
 - Dimensionless quantity (ratio of volumes)
 
-**Key phase transitions:**
-
-| Packing Fraction | Physical State | Behavior |
-|------------------|----------------|----------|
-| φ < 0.40 | Dilute fluid | Fast equilibration, high acceptance |
-| φ ≈ 0.49 | Freezing transition | Fluid → FCC crystal (equilibrium) |
-| φ ≈ 0.55 | Supercooled liquid | Metastable, slow dynamics |
-| φ ≈ 0.58 | Glass transition | Kinetic arrest, jamming |
-| φ ≈ 0.64 | Random close packing (RCP) | Disordered jammed state |
-| φ ≈ 0.74 | FCC/HCP close packing | Densest crystal packing (theoretical limit) |
-
 **Tuning recommendations:**
 
 1. **For fluid states (φ < 0.50):**
