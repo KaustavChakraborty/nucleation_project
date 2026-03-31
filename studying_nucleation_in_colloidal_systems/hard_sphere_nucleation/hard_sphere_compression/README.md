@@ -1,4 +1,4 @@
-# Hard-Sphere HPMC Compression - Comprehensive Documentation
+# Hard-Sphere HPMC Compression with fixed move size - Comprehensive Documentation
 
 **Version:** 12  
 **HOOMD-blue Version:** ≥ 4.0 (tested with 4.9.0)  
