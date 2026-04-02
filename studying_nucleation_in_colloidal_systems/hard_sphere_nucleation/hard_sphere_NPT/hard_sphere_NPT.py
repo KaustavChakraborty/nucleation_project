@@ -1677,15 +1677,47 @@ def build_simulation(
 # ===========================================================================
 
 def _write_snapshot(sim: hoomd.Simulation, filename: str) -> None:
-    """Write current state to a single-frame GSD file with diameter"""
-    # hoomd.write.GSD.write() is the one-shot static helper that writes the
-    # full simulation state to a fresh GSD file in a single call.
-    hoomd.write.GSD.write(
-        state=sim.state,
-        filename=filename,
-        mode="wb",
-        filter=hoomd.filter.All(),
-    )
+    """
+    Write the current simulation state as a single-frame GSD file.
+
+    IMPORTANT:
+    This version writes particle diameter explicitly into the output frame,
+    so the final GSD is guaranteed to contain particles/diameter.
+    """
+    snapshot = sim.state.get_snapshot()
+
+    # In MPI, particle data in get_snapshot() is present only on rank 0.
+    if not _is_root_rank():
+        return
+
+    frame = gsd.hoomd.Frame()
+
+    # -----------------------------
+    # Box
+    # -----------------------------
+    box = snapshot.configuration.box
+    frame.configuration.box = list(box)
+
+    # -----------------------------
+    # Particle data
+    # -----------------------------
+    N = int(snapshot.particles.N)
+    frame.particles.N = N
+    frame.particles.types = list(snapshot.particles.types)
+    frame.particles.typeid = np.array(snapshot.particles.typeid, dtype=np.uint32)
+    frame.particles.position = np.array(snapshot.particles.position, dtype=np.float32)
+
+    # EXPLICIT diameter write:
+    frame.particles.diameter = np.array(snapshot.particles.diameter, dtype=np.float32)
+
+    # Optional but useful: preserve image flags if present.
+    try:
+        frame.particles.image = np.array(snapshot.particles.image, dtype=np.int32)
+    except Exception:
+        pass
+
+    with gsd.hoomd.open(filename, mode="w") as traj:
+        traj.append(frame)
 
 
 def write_final_outputs(
@@ -1752,7 +1784,7 @@ def write_final_outputs(
         f"  Input GSD             : {files.input_gsd}",
         f"  Final GSD             : {files.final_gsd}",
         f"  Particles (N)         : {N}",
-        f"  Diameter (σ)          : {params.diameter}",
+        f"  Diameter (sigma)          : {params.diameter}",
         f"  Final packing frac.   : {phi:.6f}",
         f"  Target betaP          : {params.pressure}",
         f"  Overlaps at end       : {mc.overlaps}",
