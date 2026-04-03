@@ -348,72 +348,354 @@ class MoveSizeProp:
 
 class BoxMCStatus:
     """
-    Windowed overall acceptance rate of all BoxMC move types.
+    Helper class to report BoxMC move acceptance rates in a logger-friendly way.
+
+    Why this class is needed
+    ------------------------
+    HOOMD's BoxMC object stores cumulative move counters such as:
+
+        boxmc.volume_moves => (accepted, rejected)
+        boxmc.aspect_moves => (accepted, rejected)
+        boxmc.shear_moves  => (accepted, rejected)
+
+    These are cumulative from the beginning of the run, not acceptance rates
+    over the most recent logging window.
+
+    This class converts those cumulative counters into windowed acceptance
+    rates suitable for logging into `npt_hpmc_log.log`.
+
+    Important design requirement
+    ----------------------------
+    During one logging event, HOOMD may query multiple properties one after
+    another:
+
+        acceptance_rate
+        volume_acc_rate
+        aspect_acc_rate
+        shear_acc_rate
+
+    Therefore, we must NOT let one property "consume" the deltas before the
+    others are queried. To solve that, we:
+      1. compute the rates once per timestep,
+      2. cache them,
+      3. return the cached values for all properties queried at that timestep.
+
+    Meaning of the rates
+    --------------------
+    - volume_acc_rate : acceptance of HOOMD's volume_moves counter
+                        (this includes volume/length-related box moves as
+                        reported by HOOMD's BoxMC API)
+    - aspect_acc_rate : aspect ratio move acceptance
+    - shear_acc_rate  : shear move acceptance
+    - acceptance_rate : combined acceptance over all three move classes
+
+    Export dictionary
+    -----------------
+    `_export_dict` allows these quantities to be exposed to the HOOMD logger.
+    The tuple format is:
+        ("scalar", True)
+
+    meaning:
+    - scalar quantity
+    - loggable
     """
 
     _export_dict = {
         "acceptance_rate": ("scalar", True),
         "volume_acc_rate": ("scalar", True),
         "aspect_acc_rate": ("scalar", True),
-        "shear_acc_rate":  ("scalar", True),
+        "shear_acc_rate": ("scalar", True),
     }
 
-    def __init__(self, boxmc: hoomd.hpmc.update.BoxMC) -> None:
-        self.boxmc        = boxmc
-        self.prev_accepted: dict = {}
-        self.prev_total:   dict = {}
-
-    def _windowed_rate(self, move: str) -> float:
-        """Return the windowed acceptance rate for a single BoxMC move type."""
-        try:
-            moves = getattr(self.boxmc, f"{move}_moves")
-            current_accepted, current_total = moves
-            prev_accepted = self.prev_accepted.get(move, 0)
-            prev_total    = self.prev_total.get(move, 0)
-            delta_accepted = current_accepted - prev_accepted
-            delta_total    = current_total    - prev_total
-            self.prev_accepted[move] = current_accepted
-            self.prev_total[move]    = current_total
-            return delta_accepted / delta_total if delta_total else 0.0
-        except (AttributeError, ZeroDivisionError, DataAccessError):
-            return 0.0
-
-    @property
-    def acceptance_rate(self) -> float:
+    def __init__(self, boxmc, sim):
         """
-        Overall windowed acceptance rate aggregated across volume, aspect,
-        and shear moves.  Preserved from original.
+        Parameters
+        ----------
+        boxmc : hoomd.hpmc.update.BoxMC
+            The HOOMD BoxMC updater whose move counters we want to monitor.
+
+        sim : hoomd.Simulation
+            The active HOOMD simulation object.
+            We use `sim.timestep` so that we refresh the cached rates only once
+            per timestep/logging instant.
         """
-        try:
-            total_accepted = 0
-            total_attempts = 0
-            for move in ["volume", "aspect", "shear"]:
-                moves = getattr(self.boxmc, f"{move}_moves")
-                current_accepted, current_total = moves
-                delta_accepted = current_accepted - self.prev_accepted.get(move, 0)
-                delta_total    = current_total    - self.prev_total.get(move, 0)
-                self.prev_accepted[move] = current_accepted
-                self.prev_total[move]    = current_total
-                total_accepted += delta_accepted
-                total_attempts += delta_total
-            return total_accepted / total_attempts if total_attempts else 0.0
-        except (AttributeError, ZeroDivisionError, DataAccessError):
+
+        self.boxmc = boxmc
+        self.sim = sim
+
+        # Previous cumulative counters.
+        #
+        # Structure after initialization:
+        # {
+        #   "volume": (accepted_prev, rejected_prev),
+        #   "aspect": (accepted_prev, rejected_prev),
+        #   "shear":  (accepted_prev, rejected_prev),
+        # }
+        #
+        # This starts as None because before the first read we have no "previous"
+        # reference point.
+        self._prev_counts = None
+
+        # Cache bookkeeping:
+        #
+        # We compute fresh rates only once per timestep and store them here.
+        # If multiple properties are queried during the same timestep, they all
+        # use the same cached values.
+        self._cached_timestep = None
+        self._cached_rates = {
+            "overall": 0.0,
+            "volume": 0.0,
+            "aspect": 0.0,
+            "shear": 0.0,
+        }
+
+    def _safe_zero_cache(self, timestep=None):
+        """
+        Reset cached rates to zero in a controlled way.
+
+        This helper is useful when:
+        - the simulation timestep cannot be read,
+        - BoxMC counters are temporarily unavailable,
+        - HOOMD raises a data-access related exception.
+
+        Parameters
+        ----------
+        timestep : int or None
+            The timestep associated with this cache state.
+        """
+        self._cached_timestep = timestep
+        self._cached_rates = {
+            "overall": 0.0,
+            "volume": 0.0,
+            "aspect": 0.0,
+            "shear": 0.0,
+        }
+
+    def _read_counts(self):
+        """
+        Read the cumulative accepted/rejected counts from BoxMC.
+
+        Returns
+        -------
+        dict
+            Dictionary of the form:
+            {
+                "volume": (accepted, rejected),
+                "aspect": (accepted, rejected),
+                "shear":  (accepted, rejected),
+            }
+
+        Notes
+        -----
+        HOOMD BoxMC counters are cumulative.
+        They are NOT already acceptance fractions.
+
+        Exception handling
+        ------------------
+        We keep this method narrow and let the caller decide how to handle
+        failures. That keeps the logic cleaner.
+        """
+
+        # Read raw counters from HOOMD.
+        # Each returned tuple is interpreted as:
+        #     (accepted, rejected)
+        #
+        # Not:
+        #     (accepted, total)
+        a_v, r_v = self.boxmc.volume_moves
+        a_a, r_a = self.boxmc.aspect_moves
+        a_s, r_s = self.boxmc.shear_moves
+
+        # Convert to plain Python ints for safety and consistency.
+        return {
+            "volume": (int(a_v), int(r_v)),
+            "aspect": (int(a_a), int(r_a)),
+            "shear":  (int(a_s), int(r_s)),
+        }
+
+    @staticmethod
+    def _compute_rate(delta_accepted, delta_rejected):
+        """
+        Compute acceptance rate from accepted/rejected deltas.
+
+        Parameters
+        ----------
+        delta_accepted : int
+            Number of accepted moves in the logging window.
+
+        delta_rejected : int
+            Number of rejected moves in the logging window.
+
+        Returns
+        -------
+        float
+            Acceptance fraction:
+                accepted / (accepted + rejected)
+
+            If there were no attempted moves in the window, returns 0.0.
+        """
+        total_attempts = delta_accepted + delta_rejected
+        if total_attempts <= 0:
             return 0.0
+        return delta_accepted / total_attempts
+
+    def _refresh_cache(self):
+        """
+        Refresh the cached rates once per timestep.
+
+        Core idea
+        ---------
+        Suppose during one logging event HOOMD asks for:
+            1. acceptance_rate
+            2. volume_acc_rate
+            3. aspect_acc_rate
+            4. shear_acc_rate
+
+        If each property independently updates the stored "previous counts",
+        only the first property would see the actual deltas, and the rest
+        would incorrectly see zero.
+
+        To avoid that, this method:
+            - checks the current timestep,
+            - recomputes rates only if the timestep changed,
+            - stores all rates in cache together,
+            - lets all properties use the same cache.
+
+        Exception handling strategy
+        ---------------------------
+        If anything goes wrong while accessing simulation state or BoxMC data,
+        we fail gracefully and log zeros instead of crashing the simulation.
+        """
+
+        # ------------------------------------------------------------------
+        # Step 1: Read the current simulation timestep safely.
+        # ------------------------------------------------------------------
+        try:
+            current_timestep = int(self.sim.timestep)
+        except Exception:
+            # If timestep is unavailable for any reason, do not crash the run.
+            # Instead, set zero rates and return.
+            self._safe_zero_cache(timestep=None)
+            return
+
+        # ------------------------------------------------------------------
+        # Step 2: If we already refreshed at this timestep, do nothing.
+        # ------------------------------------------------------------------
+        if self._cached_timestep == current_timestep:
+            return
+
+        # ------------------------------------------------------------------
+        # Step 3: Read current cumulative BoxMC counters safely.
+        # ------------------------------------------------------------------
+        try:
+            current_counts = self._read_counts()
+        except Exception:
+            # This can happen if HOOMD temporarily does not allow reading the
+            # counters, or if the updater is not fully attached yet, or due to
+            # some other runtime access issue.
+            #
+            # We again fail gracefully and write zeros for this logging event.
+            self._safe_zero_cache(timestep=current_timestep)
+            return
+
+        # ------------------------------------------------------------------
+        # Step 4: Compute windowed deltas.
+        # ------------------------------------------------------------------
+        #
+        # If this is the first-ever observation, we do not yet have previous
+        # counts. In that case, use the currently available cumulative counts
+        # as the initial "window".
+        #
+        # That means the first logged rate corresponds to all attempts seen
+        # since counters started being tracked.
+        if self._prev_counts is None:
+            delta_counts = current_counts
+        else:
+            delta_counts = {}
+
+            for move_name in ("volume", "aspect", "shear"):
+                acc_now, rej_now = current_counts[move_name]
+                acc_prev, rej_prev = self._prev_counts[move_name]
+
+                # Compute the change since the previous logging window.
+                delta_acc = acc_now - acc_prev
+                delta_rej = rej_now - rej_prev
+
+                # Defensive programming:
+                # In normal operation, these deltas should not be negative.
+                # If they somehow are (for example, counter reset, restart edge
+                # case, or unexpected HOOMD behavior), clamp to zero rather than
+                # producing nonsense negative acceptance fractions.
+                if delta_acc < 0:
+                    delta_acc = 0
+                if delta_rej < 0:
+                    delta_rej = 0
+
+                delta_counts[move_name] = (delta_acc, delta_rej)
+
+        # Update previous counts AFTER delta computation.
+        self._prev_counts = current_counts
+
+        # ------------------------------------------------------------------
+        # Step 5: Convert per-move deltas into per-move acceptance fractions.
+        # ------------------------------------------------------------------
+        vol_acc, vol_rej = delta_counts["volume"]
+        asp_acc, asp_rej = delta_counts["aspect"]
+        shr_acc, shr_rej = delta_counts["shear"]
+
+        volume_rate = self._compute_rate(vol_acc, vol_rej)
+        aspect_rate = self._compute_rate(asp_acc, asp_rej)
+        shear_rate = self._compute_rate(shr_acc, shr_rej)
+
+        # ------------------------------------------------------------------
+        # Step 6: Compute combined overall acceptance fraction.
+        # ------------------------------------------------------------------
+        total_acc = vol_acc + asp_acc + shr_acc
+        total_rej = vol_rej + asp_rej + shr_rej
+        overall_rate = self._compute_rate(total_acc, total_rej)
+
+        # ------------------------------------------------------------------
+        # Step 7: Store results in cache for this timestep.
+        # ------------------------------------------------------------------
+        self._cached_timestep = current_timestep
+        self._cached_rates = {
+            "overall": overall_rate,
+            "volume": volume_rate,
+            "aspect": aspect_rate,
+            "shear":  shear_rate,
+        }
 
     @property
-    def volume_acc_rate(self) -> float:
-        """Windowed acceptance rate for volume moves only."""
-        return self._windowed_rate("volume")
+    def acceptance_rate(self):
+        """
+        Combined acceptance fraction over volume + aspect + shear moves.
+        """
+        self._refresh_cache()
+        return self._cached_rates["overall"]
 
     @property
-    def aspect_acc_rate(self) -> float:
-        """Windowed acceptance rate for aspect moves only."""
-        return self._windowed_rate("aspect")
+    def volume_acc_rate(self):
+        """
+        Acceptance fraction for HOOMD's `volume_moves` counter.
+        """
+        self._refresh_cache()
+        return self._cached_rates["volume"]
 
     @property
-    def shear_acc_rate(self) -> float:
-        """Windowed acceptance rate for shear moves only."""
-        return self._windowed_rate("shear")
+    def aspect_acc_rate(self):
+        """
+        Acceptance fraction for aspect-ratio box moves.
+        """
+        self._refresh_cache()
+        return self._cached_rates["aspect"]
+
+    @property
+    def shear_acc_rate(self):
+        """
+        Acceptance fraction for shear box moves.
+        """
+        self._refresh_cache()
+        return self._cached_rates["shear"]
 
 
 class BoxSeqProp:
@@ -1249,7 +1531,7 @@ def build_simulation(
     # ------------------------------------------------------------------
     # This guarantees params.diameter is always consistent with the particles HOOMD is simulating
     params.diameter = read_mono_diameter_from_gsd(state_source)
-    root_print(f"[INFO] Diameter (σ) = {params.diameter}")
+    root_print(f"[INFO] Diameter (sigma) = {params.diameter}")
 
     # Compute initial packing fraction for the startup log message.
     N   = sim.state.N_particles
@@ -1553,7 +1835,7 @@ def build_simulation(
     # ------------------------------------------------------------------
     # 9.14  Register BoxMC loggers (after boxmc exists)
     # ------------------------------------------------------------------
-    box_mc_status = BoxMCStatus(boxmc)
+    box_mc_status = BoxMCStatus(boxmc, sim)
     logger_sim[("BoxMCStatus", "acc_rate")]        = (box_mc_status, "acceptance_rate", "scalar")
     logger_sim[("BoxMCStatus", "volume_acc_rate")] = (box_mc_status, "volume_acc_rate", "scalar")  
     logger_sim[("BoxMCStatus", "aspect_acc_rate")] = (box_mc_status, "aspect_acc_rate", "scalar")  
@@ -1617,7 +1899,7 @@ def build_simulation(
             "shear_z":  params.max_move_shear,
         },
         gamma=0.8,   # tuner aggressiveness (HOOMD recommendation)
-        tol=0.01,    # convergence tolerance
+        tol=0.03,    # convergence tolerance
     )
     sim.operations.tuners.append(box_tuner)
     root_print(
@@ -1675,6 +1957,17 @@ def build_simulation(
 # ===========================================================================
 #  SECTION 10 — Output helpers
 # ===========================================================================
+
+'''def _write_snapshot(sim: hoomd.Simulation, filename: str) -> None:
+    """Write current state to a single-frame GSD file with diameter"""
+    # hoomd.write.GSD.write() is the one-shot static helper that writes the
+    # full simulation state to a fresh GSD file in a single call.
+    hoomd.write.GSD.write(
+        state=sim.state,
+        filename=filename,
+        mode="wb",
+        filter=hoomd.filter.All(),
+    )'''
 
 def _write_snapshot(sim: hoomd.Simulation, filename: str) -> None:
     """
