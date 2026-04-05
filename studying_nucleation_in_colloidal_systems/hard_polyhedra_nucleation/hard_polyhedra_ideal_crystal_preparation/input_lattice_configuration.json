@@ -1,0 +1,10 @@
+{
+    "lattice_type": "SC",
+    "phi": 0.10,
+    "shape_json": "shape_023_Cube_unit_volume_principal_frame.json",
+    "scale": 1.0,
+    "n_particles_req": 2197,
+    "orientation_mode": "disorder",
+    "rng_seed": 12345,
+    "output_gsd": "cube_sc_disorder_phi0p10.gsd"
+}
