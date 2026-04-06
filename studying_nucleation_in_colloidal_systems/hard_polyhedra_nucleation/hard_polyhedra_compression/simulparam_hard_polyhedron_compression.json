@@ -1,0 +1,39 @@
+{
+    "_section_io": "--- I/O identifiers ---",
+    "tag"                          : "HOOMD_hard_cube_2197_compression_to_pf0p58",
+    "input_gsd_filename"           : "cube_sc_disorder_phi0p10.gsd",
+
+    "_section_stage": "--- Stage control ---",
+    "stage_id_current"             : -1,
+    "initial_timestep"             : 0,
+
+    "_section_shape": "--- Convex-polyhedron shape definition ---",
+    "shape_json_filename"          : "shape_023_Cube_unit_volume_principal_frame.json",
+    "shape_scale"                  : 1.0,
+
+    "_section_physics": "--- Physical system ---",
+    "target_pf"                    : 0.58,
+
+    "_section_compression": "--- Manual compression loop parameters ---",
+    "volume_scaling_factor"        : 0.99,
+    "run_length_to_remove_overlap" : 1000,
+    "run_length_to_relax"          : 2000,
+
+    "_section_mc": "--- HPMC move parameters (fixed) ---",
+    "move_size_translation"        : 0.03,
+    "move_size_rotation"           : 0.02,
+
+    "_section_timing": "--- Output frequencies ---",
+    "restart_frequency"            : 10000,
+    "traj_out_freq"                : 100000,
+    "log_frequency"                : 100000,
+
+    "_section_hardware": "--- Hardware selection ---",
+    "use_gpu"                      : false,
+    "gpu_id"                       : 0,
+
+    "_section_filenames": "--- Output filenames ---",
+    "restart_gsd_filename"         : "HOOMD_hard_cube_2197_compression_to_pf0p58_restart.gsd",
+    "output_gsd_traj_filename"     : "HOOMD_hard_cube_2197_compression_to_pf0p58_traj.gsd",
+    "final_gsd_filename"           : "HOOMD_hard_cube_2197_compression_to_pf0p58_final.gsd"
+}
