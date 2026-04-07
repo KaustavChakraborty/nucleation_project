@@ -1,0 +1,45 @@
+{
+    "_section_io":          "--- I/O identifiers ---",
+    "tag":                  "HOOMD_hard_cube_2197_4096_at_pf0p58_nvt",
+    "input_gsd_filename":   "HOOMD_hard_cube_2197_compression_to_pf0p58_final.gsd",
+
+    "_section_stage":       "--- Stage control ---",
+    "_comment_stage":       "stage_id_current: -1 = single-stage (use filenames below); 0,1,2,... = multi-stage. In multi-stage mode all output filenames are auto-generated as <tag>_<stage_id>_<suffix> and the filenames section below is ignored.",
+    "stage_id_current":     -1,
+    "initial_timestep":     0,
+
+    "_section_shape":       "--- Convex-polyhedron shape definition ---",
+    "_comment_shape_json":  "shape_json_filename: JSON file containing the reference convex-polyhedron vertices and reference volume.",
+    "shape_json_filename":  "shape_023_Cube_unit_volume_principal_frame.json",
+    "_comment_shape_scale": "shape_scale: linear scale factor applied to all reference vertices. Actual particle volume becomes reference_volume * shape_scale^3.",
+    "shape_scale":          1.0,
+
+    "_section_run":         "--- Run length ---",
+    "_comment_run":         "total_num_timesteps: total HPMC sweeps for this stage (one sweep = one trial move per particle)",
+    "total_num_timesteps":  50000000,
+
+    "_section_mc":          "--- HPMC move parameters ---",
+    "_comment_mc_d":        "move_size_translation: fixed translational move size d for type A. Not adaptive — set to give a reasonable translational acceptance at your target packing fraction.",
+    "move_size_translation": 0.045,
+    "_comment_mc_a":        "move_size_rotation: fixed rotational move size a for type A. Set to 0.0 only if you intentionally want frozen orientations.",
+    "move_size_rotation":   0.045,
+
+    "_section_timing":      "--- Output frequencies (in HPMC sweeps) ---",
+    "_comment_log":         "log_frequency: how often to write a line to the Table log file",
+    "log_frequency":        10000,
+    "_comment_traj":        "traj_gsd_frequency: how often to append a frame to the trajectory GSD",
+    "traj_gsd_frequency":   100000,
+    "_comment_restart":     "restart_gsd_frequency: how often to overwrite the single-frame restart checkpoint GSD",
+    "restart_gsd_frequency": 10000,
+
+    "_section_hardware":    "--- Hardware selection ---",
+    "use_gpu":              false,
+    "gpu_id":               0,
+
+    "_section_filenames":   "--- Output filenames (only used when stage_id_current == -1) ---",
+    "_comment_filenames":   "In multi-stage mode (stage_id_current >= 0) these are ignored and filenames are derived automatically from tag and stage_id.",
+    "output_trajectory":    "HOOMD_hard_cube_2197_nvt_hpmc_pf0p58_output_traj.gsd",
+    "log_filename":         "HOOMD_hard_cube_2197_nvt_hpmc_pf0p58_log.log",
+    "restart_file":         "HOOMD_hard_cube_2197_nvt_hpmc_pf0p58_output_restart.gsd",
+    "final_gsd_filename":   "HOOMD_hard_cube_2197_nvt_hpmc_pf0p58_final.gsd"
+}
