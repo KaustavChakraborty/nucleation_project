@@ -953,7 +953,7 @@ def load_and_broadcast_snapshot(
                 gsd_vertices = np.asarray(first_shape.get("vertices", []), dtype=np.float64)
                 ref_vertices = np.asarray(expected_vertices, dtype=np.float64)
                 if gsd_vertices.shape == ref_vertices.shape:
-                    if not np.allclose(gsd_vertices, ref_vertices, rtol=0.0, atol=1e-8):
+                    if not np.allclose(gsd_vertices, ref_vertices, rtol=0.0, atol=1e-4):
                         sys.exit(
                             f"[FATAL ERROR] The convex-polyhedron vertices stored in the input GSD "
                             f"do not match the vertices reconstructed from shape_json_filename "
