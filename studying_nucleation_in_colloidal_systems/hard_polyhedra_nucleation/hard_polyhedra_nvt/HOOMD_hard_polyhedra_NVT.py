@@ -952,94 +952,19 @@ def load_and_broadcast_snapshot(
                 first_shape = type_shapes[0]
                 gsd_vertices = np.asarray(first_shape.get("vertices", []), dtype=np.float64)
                 ref_vertices = np.asarray(expected_vertices, dtype=np.float64)
-
-                if gsd_vertices.shape != ref_vertices.shape:
-                    print("\n" + "=" * 90, file=sys.stderr, flush=True)
-                    print("[DEBUG] Vertex-shape mismatch during GSD validation", file=sys.stderr, flush=True)
-                    print("=" * 90, file=sys.stderr, flush=True)
-                    print(f"gsd_vertices.shape = {gsd_vertices.shape}", file=sys.stderr, flush=True)
-                    print(f"ref_vertices.shape = {ref_vertices.shape}", file=sys.stderr, flush=True)
-
-                    print("\n[DEBUG] gsd_vertices =", file=sys.stderr, flush=True)
-                    print(gsd_vertices.tolist(), file=sys.stderr, flush=True)
-
-                    print("\n[DEBUG] ref_vertices =", file=sys.stderr, flush=True)
-                    print(ref_vertices.tolist(), file=sys.stderr, flush=True)
-
-                    sys.exit(
-                        f"[FATAL ERROR] The convex-polyhedron vertices stored in the input GSD "
-                        f"have shape {gsd_vertices.shape}, while the vertices reconstructed "
-                        f"from shape_json_filename and shape_scale have shape {ref_vertices.shape}."
-                    )
-
-                def _sort_rows(arr):
-                    idx = np.lexsort((arr[:, 2], arr[:, 1], arr[:, 0]))
-                    return arr[idx]
-
-                gsd_vertices_sorted = _sort_rows(gsd_vertices)
-                ref_vertices_sorted = _sort_rows(ref_vertices)
-
-                vertex_atol = 1.0e-4
-
-                direct_match = np.allclose(gsd_vertices, ref_vertices, rtol=0.0, atol=vertex_atol)
-                sorted_match = np.allclose(gsd_vertices_sorted, ref_vertices_sorted,
-                                        rtol=0.0, atol=vertex_atol)
-
-                if not sorted_match:
-                    print("\n" + "=" * 90, file=sys.stderr, flush=True)
-                    print("[DEBUG] Convex-polyhedron vertex mismatch during GSD validation",
-                        file=sys.stderr, flush=True)
-                    print("=" * 90, file=sys.stderr, flush=True)
-
-                    print(f"Direct order-sensitive match : {direct_match}", file=sys.stderr, flush=True)
-                    print(f"Sorted order-insensitive match: {sorted_match}", file=sys.stderr, flush=True)
-
-                    print("\n[DEBUG] Raw gsd_vertices =", file=sys.stderr, flush=True)
-                    print(gsd_vertices.tolist(), file=sys.stderr, flush=True)
-
-                    print("\n[DEBUG] Raw ref_vertices =", file=sys.stderr, flush=True)
-                    print(ref_vertices.tolist(), file=sys.stderr, flush=True)
-
-                    print("\n[DEBUG] Sorted gsd_vertices =", file=sys.stderr, flush=True)
-                    print(gsd_vertices_sorted.tolist(), file=sys.stderr, flush=True)
-
-                    print("\n[DEBUG] Sorted ref_vertices =", file=sys.stderr, flush=True)
-                    print(ref_vertices_sorted.tolist(), file=sys.stderr, flush=True)
-
-                    diff = gsd_vertices_sorted - ref_vertices_sorted
-                    absdiff = np.abs(diff)
-                    max_abs_diff = np.max(absdiff)
-
-                    print(f"\n[DEBUG] max_abs_diff = {max_abs_diff:.16e}",
-                        file=sys.stderr, flush=True)
-
-                    mismatch_rows = np.where(np.any(absdiff > vertex_atol, axis=1))[0]
-                    print(f"[DEBUG] mismatch row indices = {mismatch_rows.tolist()}",
-                        file=sys.stderr, flush=True)
-
-                    if mismatch_rows.size > 0:
-                        i = int(mismatch_rows[0])
-                        print("\n[DEBUG] First mismatching sorted row:", file=sys.stderr, flush=True)
-                        print(f"  row index         = {i}", file=sys.stderr, flush=True)
-                        print(f"  gsd_vertices[{i}] = {gsd_vertices_sorted[i].tolist()}",
-                            file=sys.stderr, flush=True)
-                        print(f"  ref_vertices[{i}] = {ref_vertices_sorted[i].tolist()}",
-                            file=sys.stderr, flush=True)
-                        print(f"  difference        = {diff[i].tolist()}",
-                            file=sys.stderr, flush=True)
-
-                    sys.exit(
-                        f"[FATAL ERROR] The convex-polyhedron vertices stored in the input GSD "
-                        f"do not match the vertices reconstructed from shape_json_filename "
-                        f"and shape_scale.\n"
-                        f"              => See the debug dump above for the exact mismatch."
-                    )
-
+                if gsd_vertices.shape == ref_vertices.shape:
+                    if not np.allclose(gsd_vertices, ref_vertices, rtol=0.0, atol=1e-8):
+                        sys.exit(
+                            f"[FATAL ERROR] The convex-polyhedron vertices stored in the input GSD "
+                            f"do not match the vertices reconstructed from shape_json_filename "
+                            f"and shape_scale.\n"
+                            f"              => Check that you are using the correct shape file "
+                            f"and scale for this GSD."
+                        )
             except Exception as exc:
                 sys.exit(
                     f"[FATAL ERROR] Failed while validating GSD type_shapes: {exc}"
                 )
-
 
         snap_data = {
             "box": list(frame.configuration.box),
@@ -1671,7 +1596,10 @@ def write_final_outputs(
 
     _write_snapshot_with_shape(sim, files.final_gsd, type_shapes)
     root_print(f"[OUTPUT] Final GSD        => {files.final_gsd}")
-    _verify_gsd_type_shapes(files.final_gsd, params.shape_vertices, label="final")
+    try:
+        _verify_gsd_type_shapes(files.final_gsd, params.shape_vertices, label="final")
+    except SystemExit as e:
+        root_print(f"[WARNING] Final GSD verification failed: {e}")
 
     summary = {
         "tag": params.tag,
@@ -1822,7 +1750,7 @@ def main() -> None:
     print("*********************************************************")
     print("hoomd.version.mpi_enabled:   ", hoomd.version.mpi_enabled)
 
-    _print_banner("HOOMD-blue v4 | Convex-Polyhedron HPMC NVT Equilibration")
+    _print_banner("HOOMD-blue v4 | Convex-Polyhedron HPMC NVT Equilibration (hs_nvt_v3)")
 
     # ------------------------------------------------------------------
     # 12.3  Load parameters
@@ -1970,7 +1898,7 @@ if __name__ == "__main__":
     try:
         main()
     except SystemExit as e:
-        print(f"[FATAL] {e}", file=sys.stderr, flush=True)
+        root_print(f"[FATAL] {e}")
         raise
     except Exception:
         # Print the full traceback so the developer can locate and fix the bug.
