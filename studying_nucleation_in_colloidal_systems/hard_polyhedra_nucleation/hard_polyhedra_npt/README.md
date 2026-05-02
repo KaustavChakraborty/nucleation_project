@@ -1,1086 +1,914 @@
-# HOOMD-blue v4.9 — Hard Convex-Polyhedron NPT Simulation
-
-A production-grade Hard-Particle Monte Carlo (HPMC) simulation framework for
-running constant-pressure (NPT) ensembles of **hard convex polyhedra** using
-[HOOMD-blue v4](https://hoomd-blue.readthedocs.io/en/v4.9.0/).
-The code is designed for both interactive workstations and large-scale HPC
-clusters via MPI, and ships with a fully-annotated JSON parameter file and a
-ready-to-use unit-cube shape definition.
-
----
+# HOOMD Hard Polyhedra NPT Simulation — Complete Reference
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Physics Background](#physics-background)
-3. [File Inventory](#file-inventory)
-4. [Dependencies and Installation](#dependencies-and-installation)
-5. [Quick Start](#quick-start)
-6. [Input Files in Detail](#input-files-in-detail)
-   - [Simulation Parameter JSON](#simulation-parameter-json)
-   - [Shape JSON](#shape-json)
-   - [Input GSD](#input-gsd)
-7. [Parameter Reference](#parameter-reference)
-   - [I/O and Run Identity](#io-and-run-identity)
-   - [Stage Control](#stage-control)
-   - [Shape Definition](#shape-definition)
-   - [Run Lengths](#run-lengths)
-   - [Output Frequencies](#output-frequencies)
-   - [HPMC Particle Moves](#hpmc-particle-moves)
-   - [BoxMC NPT Parameters](#boxmc-npt-parameters)
-   - [BoxMC Initial Move Deltas](#boxmc-initial-move-deltas)
-   - [BoxMCMoveSize Tuner Caps](#boxmcmovesize-tuner-caps)
-   - [SDF Pressure Compute](#sdf-pressure-compute)
-   - [Hardware Selection](#hardware-selection)
-   - [Output Filenames (single-stage mode)](#output-filenames-single-stage-mode)
-8. [Output Files](#output-files)
-9. [Simulation Algorithm](#simulation-algorithm)
-   - [Two-Phase Architecture](#two-phase-architecture)
-   - [Equilibration Loop](#equilibration-loop)
-   - [Production Run](#production-run)
-   - [SDF Pressure Attachment](#sdf-pressure-attachment)
-10. [Multi-Stage Pipeline Mode](#multi-stage-pipeline-mode)
-11. [MPI Parallel Execution](#mpi-parallel-execution)
-12. [Restart and Crash Recovery](#restart-and-crash-recovery)
-13. [Code Architecture](#code-architecture)
-    - [Section Map](#section-map)
-    - [Custom Loggable Classes](#custom-loggable-classes)
-    - [MPI-Safe Snapshot Loading](#mpi-safe-snapshot-loading)
-    - [Random Seed Management](#random-seed-management)
-14. [Analysing the Output](#analysing-the-output)
-    - [Reading the Table Log](#reading-the-table-log)
-    - [Reading the Scalar GSD Log](#reading-the-scalar-gsd-log)
-    - [Reading the Trajectory GSD](#reading-the-trajectory-gsd)
-    - [EOS Cross-Check via SDF](#eos-cross-check-via-sdf)
-15. [Hard-Cube Example Run](#hard-cube-example-run)
-16. [Tuning Guide](#tuning-guide)
-    - [Choosing equil_steps](#choosing-equil_steps)
-    - [Choosing Initial Move Sizes](#choosing-initial-move-sizes)
-    - [Choosing betaP](#choosing-betap)
-    - [Choosing sdf_xmax and sdf_dx](#choosing-sdf_xmax-and-sdf_dx)
-17. [Adding a New Polyhedron Shape](#adding-a-new-polyhedron-shape)
-18. [Error Messages and Troubleshooting](#error-messages-and-troubleshooting)
-19. [Known Limitations](#known-limitations)
-20. [References](#references)
+1. [Project Overview](#1-project-overview)
+2. [Physical Background](#2-physical-background)
+3. [Dependencies and Requirements](#3-dependencies-and-requirements)
+4. [Repository File Inventory](#4-repository-file-inventory)
+5. [Quick Start](#5-quick-start)
+6. [Configuration Reference — `simulparam` JSON](#6-configuration-reference--simulparam-json)
+7. [Detailed Workflow and Execution Sequence](#7-detailed-workflow-and-execution-sequence)
+8. [Equilibration Phase — In Depth](#8-equilibration-phase--in-depth)
+9. [Production Phase — In Depth](#9-production-phase--in-depth)
+10. [Output Files — Complete Reference](#10-output-files--complete-reference)
+11. [Multi-Stage Pipeline Mode](#11-multi-stage-pipeline-mode)
+12. [MPI Parallel Execution](#12-mpi-parallel-execution)
+13. [Restart and Recovery](#13-restart-and-recovery)
+14. [Logged Quantities Reference](#14-logged-quantities-reference)
+15. [Custom Loggable Classes — Internal Design](#15-custom-loggable-classes--internal-design)
+16. [SDF Pressure Estimator](#16-sdf-pressure-estimator)
+17. [Random Seed Management](#17-random-seed-management)
+18. [Error Handling and Crash Recovery](#18-error-handling-and-crash-recovery)
+19. [Tuning Strategy and Acceptance Rate Targets](#19-tuning-strategy-and-acceptance-rate-targets)
+20. [Worked Example — The Elongated Square Gyrobicupola Run](#20-worked-example--the-elongated-square-gyrobicupola-run)
+21. [Frequently Asked Questions](#21-frequently-asked-questions)
+22. [Glossary](#22-glossary)
 
 ---
 
-## Overview
+## 1. Project Overview
 
-This project implements a full NPT HPMC workflow for **any convex polyhedron**
-whose vertices can be described in a JSON file. Given an initial particle
-configuration (in GSD format) and a target reduced pressure `βP = P/(kBT)`,
-the simulation:
+This project performs constant-pressure hard-polyhedron Monte Carlo simulations using **HOOMD-blue v4.9**. It uses the **Hard-Particle Monte Carlo (HPMC)** engine, which simulates systems of particles whose only interaction is an infinite hard-core repulsion — particles cannot overlap, and any configuration that creates an overlap is immediately rejected. The pressure is maintained via a **BoxMC** updater that proposes random changes to the simulation box, implementing the NPT (constant particle number, pressure, and temperature) statistical ensemble.
 
-- Equilibrates the simulation box at the target pressure using an adaptive
-  `BoxMCMoveSize` tuner that automatically determines optimal box-move step sizes.
-- Tunes particle translational and rotational acceptance rates via a `MoveSize`
-  tuner that remains active throughout production.
-- Runs a production phase with fixed box-move sizes to collect statistically
-  valid ensemble averages.
-- Computes the instantaneous pressure via the Scale Distribution Function (SDF)
-  method and logs it for equation-of-state cross-checking.
-- Writes trajectory GSD, restart GSD, tabular text logs, and a machine-readable
-  summary JSON on completion.
+The primary scientific goal is to explore the **phase behaviour of hard convex polyhedra** — a central problem in soft condensed matter and self-assembly research, where entropy alone drives the formation of ordered structures such as crystals and liquid crystals.
 
-The parameter file (`simulparam_hard_polyhedra_npt.json`) shipped with the code
-is configured for **N = 2197 hard cubes** at a target `βP = 50`, starting from
-a pre-equilibrated NVT configuration at packing fraction φ ≈ 0.58.
+The script `HOOMD_hard_polyhedra_NPT_v6.py` is a self-contained, production-quality simulation driver. It handles:
+
+- Parsing and validating all parameters from a JSON file
+- Initialising the simulation from a prior configuration (GSD file)
+- Running an adaptive **equilibration** phase where box and particle move sizes are automatically tuned
+- Running a **production** phase with fixed move sizes where trajectory and log data are written
+- Graceful restart from checkpoints if a job is interrupted
+- MPI-parallel execution with a single code path
+- Comprehensive output files for post-processing
 
 ---
 
-## Physics Background
+## 2. Physical Background
 
 ### Hard-Particle Monte Carlo (HPMC)
 
-HPMC simulates systems of hard (athermal) particles where the pair potential is
-purely repulsive:
+In HPMC, trial moves are generated by randomly translating and rotating a particle. A move is accepted if and only if the new position/orientation is **overlap-free** with all neighbouring particles. Because there is no potential energy, the Boltzmann weight of an overlap-free move is always 1, so the acceptance probability is simply 1 (accepted) or 0 (rejected due to overlap). This implements a sampling of the hard-particle canonical ensemble exactly.
 
-```
-U(r) = 0    if particles do not overlap
-U(r) = ∞   if particles overlap
-```
-
-The Metropolis acceptance criterion therefore simplifies to: accept any trial
-move that produces no overlaps; reject all moves that produce overlaps. There is
-no energy evaluation — only geometry. This makes HPMC extremely efficient for
-hard-core systems.
-
-Each **MC sweep** attempts `N` trial moves (one per particle on average), where
-each trial randomly proposes either a translation or a rotation:
-
-- **Translation:** `r_new = r_old + d·ξ`, where `ξ` is a uniform random vector
-  on the sphere of radius 1 and `d` (`mc.d["A"]`) is the maximum displacement.
-- **Rotation:** A random quaternion rotation by at most `a` (`mc.a["A"]`) radians
-  on the unit quaternion sphere is applied to the particle orientation.
+One **MC sweep** (one timestep in HOOMD's HPMC) consists of N attempted moves, where N is the number of particles. After one sweep, on average every particle has been attempted once.
 
 ### NPT Ensemble via BoxMC
 
-The NPT (constant particle number N, pressure P, temperature T) ensemble is
-implemented using `hoomd.hpmc.update.BoxMC`, which proposes trial changes to
-the simulation box. Trial box changes are accepted/rejected via the NPT
-Metropolis criterion:
+To simulate at constant pressure instead of constant volume, a **BoxMC** updater is attached. It periodically proposes trial changes to the simulation box:
 
-```
-P_acc = min(1, exp( −βP·ΔV + N·ln(V_new/V_old) ))
-```
+- **Length moves**: independently perturb `Lx`, `Ly`, `Lz` (the three box edge lengths) at fixed shape
+- **Shear moves**: perturb the three tilt factors `xy`, `xz`, `yz` that define the triclinic box geometry
 
-where `βP = P/(kBT)` is the dimensionless reduced pressure. Four orthogonal
-box-move types are enabled:
-
-| Move type | What changes | Key parameter |
-|-----------|-------------|---------------|
-| **Volume** | Isotropic V → V + ΔV | `boxmc_volume_delta` |
-| **Length** | Independent ΔLx, ΔLy, ΔLz | `boxmc_length_delta` |
-| **Aspect** | Rescale one axis at constant V | `boxmc_aspect_delta` |
-| **Shear** | Change tilt factors xy, xz, yz | `boxmc_shear_delta` |
-
-Volume moves drive the system to the target pressure. Length and aspect moves
-allow the box to relax to a non-cubic equilibrium shape (important for crystal
-phases). Shear moves allow triclinic box deformations, necessary when simulating
-phases such as the simple-cubic or body-centred-cubic crystals of hard cubes.
+A proposed box change is accepted or rejected using the **NPT Metropolis criterion**, which includes both the pV work term (pressure times the volume change) and the Jacobian factor N·ln(V_new/V_old) that accounts for the change in the configurational integral. The dimensionless reduced pressure **βP = P/(k_BT)** (set via the `pressure` parameter) controls how strongly the system resists volume increases.
 
 ### Reduced Units
 
-All length quantities are in units of the simulation length unit σ (conventionally
-the particle edge length or diameter). The reduced pressure is:
+All quantities are in **HOOMD reduced units**: length in units of σ (defined by the shape scale), energy in units of k_BT (which equals 1), and mass in arbitrary units. The parameter `pressure` in the JSON is therefore directly `βP = P/(k_BT)`.
 
-```
-βP* = P σ³ / (kBT)
-```
+### Packing Fraction
 
-For hard cubes with unit volume (`V_particle = 1.0` and `shape_scale = 1.0`),
-σ = 1 and the particle volume equals 1.0, so the packing fraction is:
-
-```
-φ = N · V_particle / V_box = N / V_box
-```
-
-At `βP = 50` and N = 2197, the equilibrium packing fraction for hard cubes is
-approximately φ ≈ 0.50–0.55 depending on phase.
+The packing fraction `φ = N·v_p / V`, where `v_p` is the volume of a single particle and `V` is the box volume. At equilibrium under a given pressure, the simulation samples `φ` values distributed around the equation-of-state value for that pressure. The SDF method (see §16) provides an independent cross-check of the measured pressure.
 
 ---
 
-## File Inventory
+## 3. Dependencies and Requirements
+
+| Package | Version | Role |
+|---|---|---|
+| **HOOMD-blue** | ≥ 4.0 (tested: 4.9) | Core simulation engine, HPMC integrator, BoxMC, loggers, GSD writers |
+| **GSD** | ≥ 3.0 | Reading/writing GSD trajectory and restart files |
+| **NumPy** | any modern | Array operations, vertex loading, packing fraction calculations |
+| **mpi4py** | optional | Enables multi-rank MPI parallel execution (serial fallback is built in) |
+
+**Installation (Conda, recommended):**
+```bash
+conda create -n hoomd4 -c conda-forge hoomd=4.9 gsd numpy mpi4py
+conda activate hoomd4
+```
+
+**Installation (pip, GPU builds may require manual HOOMD compilation):**
+```bash
+pip install gsd numpy
+# HOOMD must be installed from source or pre-built binary for your CUDA version
+```
+
+**Python version:** 3.8 or later (uses `dataclasses`, `f-strings`, `pathlib`, `secrets`).
+
+---
+
+## 4. Repository File Inventory
 
 ```
 .
-├── HOOMD_hard_polyhedra_NPT.py                  # Main simulation script
-├── simulparam_hard_polyhedra_npt.json           # Example parameter file (hard cubes, βP=50)
-├── shape_023_Cube_unit_volume_principal_frame.json  # Cube shape definition (unit volume)
-└── README.md                                    # This file
-
-# Required before running (not included — must be generated separately):
-└── HOOMD_hard_cube_2197_nvt_hpmc_pf0p58_final.gsd  # Input configuration (N=2197 hard cubes)
+├── HOOMD_hard_polyhedra_NPT_v6.py            # Main simulation driver (this script)
+├── simulparam_hard_polyhedra_npt_v6.json     # Example parameter file (P=70 run)
+├── shape_048_Elongated_Square_Gyrobicupola_unit_volume_principal_frame.json
+│                                             # Shape definition: vertices + volume
+├── HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P50_final.gsd
+│                                             # Input configuration (output of P=50 run)
+│
+│   --- Generated on first run ---
+├── random_seed.json                          # Persistent RNG seed (single-stage mode)
+├── random_seed_stage_0.json                  # Persistent RNG seed (multi-stage mode)
+│
+│   --- Generated during simulation ---
+├── HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_output_traj.gsd
+├── HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_restart.gsd
+├── HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_final.gsd
+├── HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_scalar_log.gsd
+├── npt_hpmc_log.log
+├── box_npt_log.log
+└── HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_stage-1_npt_summary.json
 ```
+
+### Shape JSON Format
+
+The shape JSON file must contain:
+- A key named `"vertices"` (or any key ending with `_vertices`) holding an array of shape `(N_v, 3)` — the 3D Cartesian coordinates of each vertex of the convex polyhedron.
+- A key named `"volume"` (or any key ending with `_volume`) holding the reference particle volume as a scalar.
+
+The script's flexible key matching (via suffix-based lookup) means annotated keys like `"polyhedron_vertices"` or `"convex_volume"` also work without editing the code.
 
 ---
 
-## Dependencies and Installation
+## 5. Quick Start
 
-### Required
+### Minimum required files before running:
+1. The Python script `HOOMD_hard_polyhedra_NPT_v6.py`
+2. A parameter JSON file (e.g., `simulparam_hard_polyhedra_npt_v6.json`)
+3. The shape JSON file referenced by `shape_json_filename` in the parameter file
+4. The input GSD file referenced by `input_gsd_filename` in the parameter file
 
-| Package | Version | Notes |
-|---------|---------|-------|
-| Python | ≥ 3.9 | f-strings, `dataclass`, `list[str]` annotations |
-| [HOOMD-blue](https://hoomd-blue.readthedocs.io/en/v4.9.0/) | ≥ 4.0 | GPU support requires CUDA build |
-| [GSD](https://gsd.readthedocs.io/) | ≥ 3.0 | HOOMD's native file format |
-| NumPy | ≥ 1.21 | Array operations for snapshot handling |
-
-### Optional
-
-| Package | Version | Notes |
-|---------|---------|-------|
-| [mpi4py](https://mpi4py.readthedocs.io/) | ≥ 3.0 | Required for MPI-parallel runs; a serial stub is provided for single-process use |
-
-### Conda Installation (recommended)
-
+### Serial (single CPU core):
 ```bash
-# Create a dedicated environment
-conda create -n hoomd4 python=3.11
-conda activate hoomd4
-
-# Install HOOMD-blue and dependencies from conda-forge
-conda install -c conda-forge hoomd gsd numpy
-
-# For MPI-parallel runs (requires a working MPI installation)
-conda install -c conda-forge mpi4py openmpi
+python HOOMD_hard_polyhedra_NPT_v6.py \
+    --simulparam_file simulparam_hard_polyhedra_npt_v6.json
 ```
 
-### Pip Installation
-
+### MPI parallel (8 CPU cores):
 ```bash
-pip install hoomd gsd numpy
-# For MPI:
-pip install mpi4py
+mpirun -n 8 python HOOMD_hard_polyhedra_NPT_v6.py \
+    --simulparam_file simulparam_hard_polyhedra_npt_v6.json
 ```
 
-### Verifying the Installation
+### GPU execution:
+Set `"use_gpu": true` and `"gpu_id": 0` in the JSON, then run the script normally. HOOMD automatically uses the GPU device.
 
-```bash
-python -c "import hoomd; print('HOOMD version:', hoomd.version.version)"
-python -c "import gsd; print('GSD version:', gsd.version.version)"
-python -c "from mpi4py import MPI; print('MPI available:', MPI.COMM_WORLD.Get_size())"
-```
-
----
-
-## Quick Start
-
-### 1. Prepare an Initial Configuration
-
-The simulation requires an input GSD file containing an overlap-free starting
-configuration. Generate one using any HOOMD NVT or compression tool, or use
-`freud` / `garnett` to create lattice configurations.
-
-For the supplied example (N = 2197 hard cubes), you need a file named:
-```
-HOOMD_hard_cube_2197_nvt_hpmc_pf0p58_final.gsd
-```
-
-This is typically generated by running a prior NVT HPMC simulation at φ ≈ 0.58
-and saving the final frame.
-
-### 2. Run the Simulation (serial)
-
-```bash
-python HOOMD_hard_polyhedra_NPT.py \
-    --simulparam_file simulparam_hard_polyhedra_npt.json
-```
-
-### 3. Run with MPI (parallel, 8 ranks)
-
-```bash
-mpirun -n 8 python HOOMD_hard_polyhedra_NPT.py \
-    --simulparam_file simulparam_hard_polyhedra_npt.json
-```
-
-### 4. Run on a Slurm Cluster
-
+### Slurm HPC cluster (example batch script):
 ```bash
 #!/bin/bash
-#SBATCH --job-name=hard_cube_npt
-#SBATCH --nodes=1
+#SBATCH --job-name=hoomd_npt
 #SBATCH --ntasks=8
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=1
+#SBATCH --time=48:00:00
 
 conda activate hoomd4
-mpirun -n 8 python HOOMD_hard_polyhedra_NPT.py \
-    --simulparam_file simulparam_hard_polyhedra_npt.json
-```
-
-### Expected Console Output
-
-On a successful run you will see output similar to:
-
-```
-*********************************************************
-HOOMD-blue version:   4.9.0
-*********************************************************
-hoomd.version.mpi_enabled:    True
-[INFO] Running on CPU (hoomd.device.CPU)
-[INFO] Loaded parameters from 'simulparam_hard_polyhedra_npt.json'
-[INFO] Fresh run from: 'HOOMD_hard_cube_2197_nvt_hpmc_pf0p58_final.gsd'
-[INFO] N=2197 | initial phi=0.580000
-[INFO] Target betaP = 50
-[INFO] Overlap check PASSED: initial overlap count = 0
-[INFO] EQUILIBRATION: 5000000 steps | checking every 2500 steps | max 2000 chunks
-  [EQUIL chunk   1/2000] step=      2500 | phi=0.57831 | box_tuner.tuned=False | d=0.04500 | a=0.04500
-  [EQUIL chunk   2/2000] step=      5000 | phi=0.57654 | box_tuner.tuned=False | d=0.04612 | a=0.04587
-  ...
-  [EQUIL chunk 247/2000] step=    617500 | phi=0.53210 | box_tuner.tuned=True  | d=0.04823 | a=0.04911
-[INFO] BoxMCMoveSize tuner converged and removed at step 617500.
-[INFO] SDF compute attached at step 617500.
-[INFO] Production: 45000000 steps starting at step 617500
-...
-[INFO] Production complete at step 50617500 | overlaps=0
-[OUTPUT] Final GSD    => HOOMD_hard_cube_2197_hpmc_npt_P50_final.gsd
-[OUTPUT] Summary JSON => HOOMD_hard_cube_2197_hpmc_npt_P50_stage-1_npt_summary.json
+mpirun -n 8 python HOOMD_hard_polyhedra_NPT_v6.py \
+    --simulparam_file simulparam_hard_polyhedra_npt_v6.json
 ```
 
 ---
 
-## Input Files in Detail
+## 6. Configuration Reference — `simulparam` JSON
 
-### Simulation Parameter JSON
+All simulation parameters live in a single JSON file. Keys beginning with `_` are treated as **inline comments** and are silently ignored by the parser — you can annotate the file freely without affecting the simulation. The example file for the P=70 run is reproduced and annotated below.
 
-`simulparam_hard_polyhedra_npt.json` is a single flat JSON object. Keys
-starting with `_` (e.g. `"_section_io"`, `"_comment_stage"`) are documentation
-annotations and are silently stripped before parsing — they have no effect on
-the simulation. This convention allows you to freely annotate the file without
-causing validation errors.
+### I/O Identifiers
 
-The full schema is described in the [Parameter Reference](#parameter-reference)
-section below.
-
-### Shape JSON
-
-`shape_023_Cube_unit_volume_principal_frame.json` defines the convex polyhedron
-for HOOMD's HPMC integrator. The script reads two fields (with flexible key-suffix
-matching):
-
-| Field | Matched by suffix | Value (cube) | Description |
-|-------|------------------|--------------|-------------|
-| `8_vertices` | `_vertices` | 8 × [x,y,z] | Vertex coordinates in the body frame, centered at origin |
-| `4_volume` | `_volume` | 1.0 | Volume of the reference (unscaled) polyhedron |
-
-The cube is defined with vertices at (±0.5, ±0.5, ±0.5) so its edge length is
-1.0 and its volume is exactly 1.0. All vertices are in the **principal frame**
-(eigenvectors of the moment-of-inertia tensor), ensuring the particle orientation
-quaternions stored in the GSD are physically meaningful.
-
-**Key-suffix matching:** The script searches for any key whose name exactly
-equals `vertices` or ends with `_vertices` (e.g. `polyhedron_vertices`,
-`8_vertices`). The same rule applies to `volume`. This makes the script
-compatible with various shape-library conventions without requiring fixed key names.
-
-### Input GSD
-
-The input GSD file must contain at least one frame with the following particle
-data:
-
-| Field | Shape | dtype | Description |
-|-------|-------|-------|-------------|
-| `particles.position` | (N, 3) | float64 | Particle positions in box-fractional or absolute coordinates |
-| `particles.orientation` | (N, 4) | float64 | Unit quaternions (w, x, y, z) |
-| `particles.typeid` | (N,) | int32 | Type indices (all 0 for a single-component system) |
-| `particles.types` | list | str | Type labels (e.g. `["A"]`) |
-| `configuration.box` | [6] | float64 | [Lx, Ly, Lz, xy, xz, yz, ...] |
-
-The **last frame** of the input GSD is always used as the starting configuration,
-making it safe to pass in a multi-frame trajectory GSD (e.g. from a prior
-run's trajectory file).
-
-The script performs an initial overlap check (`sim.run(0)`) immediately after
-loading the configuration. The run will abort with a `[FATAL]` error if any
-overlaps are detected, since a non-zero starting overlap count indicates a
-physically invalid configuration that cannot be simulated.
-
----
-
-## Parameter Reference
-
-All parameters are set in the JSON parameter file. Required parameters must be
-present; optional parameters fall back to the defaults shown.
-
-### I/O and Run Identity
-
-| Key | Type | Required | Example | Description |
-|-----|------|----------|---------|-------------|
-| `tag` | str | ✓ | `"HOOMD_hard_cube_2197_hpmc_npt_P50"` | Human-readable label. Used as a prefix for all output files in multi-stage mode and for the summary JSON filename. |
-| `input_gsd_filename` | str | ✓ | `"...nvt_final.gsd"` | Path to the starting configuration GSD. In multi-stage mode with `stage_id > 0`, this is automatically overridden by the previous stage's final GSD. |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `tag` | string | `"HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70"` | Human-readable label. Prefixes all output files in multi-stage mode. Also used in the summary JSON filename. |
+| `input_gsd_filename` | string | `"...P50_final.gsd"` | Path to the starting configuration GSD file. Must exist before the run begins. |
 
 ### Stage Control
 
-| Key | Type | Required | Default | Example | Description |
-|-----|------|----------|---------|---------|-------------|
-| `stage_id_current` | int | ✓ | — | `-1` | `-1` = single-stage (use explicit filenames from JSON); `0`, `1`, `2`, ... = multi-stage pipeline (all filenames auto-prefixed). See [Multi-Stage Pipeline Mode](#multi-stage-pipeline-mode). |
-| `initial_timestep` | int | — | `0` | `0` | Starting timestep for fresh runs. Restart runs continue from the checkpoint's timestep. |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `stage_id_current` | int | `-1` | `-1` = single-stage mode (filenames taken directly from JSON). `0`, `1`, `2`, … = multi-stage pipeline mode (files are auto-prefixed; see §11). |
+| `initial_timestep` | int | `0` | (Optional) Initial timestep counter. Only used in fresh runs in single-stage mode. Defaults to 0. |
 
 ### Shape Definition
 
-| Key | Type | Required | Default | Example | Description |
-|-----|------|----------|---------|---------|-------------|
-| `shape_json_filename` | str | ✓ | — | `"shape_023_Cube_unit_volume_principal_frame.json"` | Path to the shape JSON containing vertex coordinates and reference volume. |
-| `shape_scale` | float | ✓ | — | `1.0` | Linear scale factor applied to all vertices. `particle_volume = reference_volume × shape_scale³`. Use `1.0` to keep the reference shape unchanged. |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `shape_json_filename` | string | `"shape_048_...json"` | Path to the convex-polyhedron shape JSON. Contains vertex coordinates and reference volume. |
+| `shape_scale` | float | `1.0` | Scale factor applied to the vertices. Scaled vertices = scale × reference vertices. Particle volume = scale³ × reference volume. Use 1.0 to keep unit volume. |
 
 ### Run Lengths
 
-| Key | Type | Required | Default | Example | Description |
-|-----|------|----------|---------|---------|-------------|
-| `total_num_timesteps` | int | ✓ | — | `50000000` | Total MC sweeps including both equilibration and production. `production_steps = total_num_timesteps − equil_steps`. |
-| `equil_steps` | int | ✓ | — | `5000000` | Sweeps reserved for equilibration. Must be strictly less than `total_num_timesteps`. |
-| `equil_steps_check_freq` | int | ✓ | — | `2500` | Chunk size for the equilibration polling loop. After every `equil_steps_check_freq` sweeps, the loop checks whether `box_tuner.tuned` is True and exits early if so. Should divide `equil_steps` evenly for predictable total step counts. |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `total_num_timesteps` | int | `50000000` | Total MC sweeps for the entire run (equilibration + production combined). |
+| `equil_steps` | int | `5000000` | MC sweeps reserved for the equilibration phase. **Production steps = total − equil.** Here: 50,000,000 − 5,000,000 = 45,000,000 production steps. |
+| `equil_steps_check_freq` | int | `5000` | The equilibration loop runs in sub-chunks of this length. After each chunk the script checks whether the BoxMCMoveSize tuner has converged (`box_tuner.tuned == True`) and exits early if it has. Must evenly divide `equil_steps`. |
 
 ### Output Frequencies
 
-All values are in MC sweeps (timesteps).
+All frequencies are in units of MC sweeps (HOOMD timesteps). More frequent writing gives finer temporal resolution but larger files.
 
-| Key | Type | Required | Default | Example | Description |
-|-----|------|----------|---------|---------|-------------|
-| `log_frequency` | int | ✓ | — | `5000` | Trigger period for the main Table log (`npt_hpmc_log.log`), box Table log, and scalar GSD log. |
-| `traj_gsd_frequency` | int | ✓ | — | `50000` | Trigger period for appending a full particle frame to the trajectory GSD. |
-| `restart_gsd_frequency` | int | ✓ | — | `5000` | Trigger period for overwriting the single-frame restart GSD. Smaller values reduce data loss on crash at the cost of I/O overhead. |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `log_frequency` | int | `5000` | How often to write a row to the simulation table log (`npt_hpmc_log.log`) and to the scalar GSD log. Here: every 5,000 sweeps. |
+| `traj_gsd_frequency` | int | `50000` | How often to append a full particle-position frame to the trajectory GSD. Here: every 50,000 sweeps. |
+| `restart_gsd_frequency` | int | `5000` | How often to overwrite the single-frame restart checkpoint. Smaller values give more frequent checkpoints at the cost of slightly more I/O. Here: every 5,000 sweeps. |
 
-### HPMC Particle Moves
+### HPMC Move Parameters
 
-| Key | Type | Required | Default | Example | Description |
-|-----|------|----------|---------|---------|-------------|
-| `move_size_translation` | float | ✓ | — | `0.045` | Initial translational move size `d` (simulation length units). The maximum displacement tried per move is `d`. Tuned adaptively toward `target_particle_trans_move_acc_rate`. |
-| `move_size_rotation` | float | ✓ | — | `0.045` | Initial rotational move size `a` (quaternion rotation angle, radians). Tuned adaptively. |
-| `trans_move_size_tuner_freq` | int | ✓ | — | `1000` | Translational `MoveSize` tuner trigger period (sweeps). |
-| `rot_move_size_tuner_freq` | int | ✓ | — | `1000` | Rotational `MoveSize` tuner trigger period (sweeps). |
-| `target_particle_trans_move_acc_rate` | float | ✓ | — | `0.3` | Target translational acceptance fraction in (0, 1). Typical range 0.2–0.4. |
-| `target_particle_rot_move_acc_rate` | float | ✓ | — | `0.3` | Target rotational acceptance fraction in (0, 1). |
-| `max_translation_move` | float | — | `0.2` | `0.2` | Hard cap on `d` imposed by the `MoveSize` tuner. Prevents excessively large displacements at low density. |
-| `max_rotation_move` | float | — | `0.5` | `0.5` | Hard cap on `a` imposed by the `MoveSize` tuner. |
+These control the **particle** (translation and rotation) trial move amplitudes.
 
-**Note on the MoveSize tuner:** Unlike the BoxMCMoveSize tuner, the particle
-MoveSize tuners are **never removed**. They remain active during production so
-that `d` and `a` can track the slowly evolving acceptance rate as the box
-volume fluctuates in the NPT ensemble. Removing them during production would
-cause the acceptance rate to drift as density changes.
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `move_size_translation` | float | `0.018` | Initial maximum translational displacement d (in σ). The MoveSize tuner adjusts this during equilibration. |
+| `move_size_rotation` | float | `0.018` | Initial maximum rotational displacement a (in radians, roughly). Tuned alongside d. |
+| `trans_move_size_tuner_freq` | int | `1000` | How often (in sweeps) the MoveSize tuner fires to adjust d. |
+| `rot_move_size_tuner_freq` | int | `1000` | How often the MoveSize tuner fires to adjust a. |
+| `max_translation_move` | float | `0.2` | Hard upper bound on d. The tuner will never set d above this value. |
+| `max_rotation_move` | float | `0.5` | Hard upper bound on a. |
+| `target_particle_trans_move_acc_rate` | float | `0.3` | Target translational acceptance rate (fraction of proposed moves accepted). 0.2–0.3 is standard for dense hard-particle systems. |
+| `target_particle_rot_move_acc_rate` | float | `0.3` | Target rotational acceptance rate. |
 
-### BoxMC NPT Parameters
+### BoxMC Parameters
 
-| Key | Type | Required | Default | Example | Description |
-|-----|------|----------|---------|---------|-------------|
-| `npt_freq` | int | ✓ | — | `10` | BoxMC trigger period (sweeps). A value of 10 means one box-move attempt for every 10 particle-move sweeps. Smaller values = more frequent box moves. |
-| `pressure` | float | ✓ | — | `50` | Target reduced pressure `βP = P/(kBT)`. Must be > 0. In reduced units (σ=1, kBT=1), `βP = 50` for hard cubes corresponds to a dense fluid or crystal phase. |
-| `box_tuner_freq` | int | ✓ | — | `2000` | `BoxMCMoveSize` tuner trigger period. Firing less often (larger value) gives more moves between tuning events for more reliable acceptance statistics. |
-| `target_box_movement_acc_rate` | float | ✓ | — | `0.3` | Target acceptance fraction for all box move types. In (0, 1). |
+These control the **box** (volume and shape) trial move amplitudes.
+
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `npt_freq` | int | `25` | BoxMC trigger period. The BoxMC updater attempts a box move every 25 MC sweeps. Smaller values = more frequent box moves. |
+| `pressure` | float | `70` | Target reduced pressure βP = P/(k_BT). This is the primary thermodynamic state variable for NPT. The system will equilibrate to the density corresponding to this pressure on the hard-polyhedron equation of state. |
+| `box_tuner_freq` | int | `1000` | How often the BoxMCMoveSize tuner fires to adjust box move amplitudes. |
+| `target_box_movement_acc_rate` | float | `0.3` | Target acceptance rate for box moves. The BoxMCMoveSize tuner adjusts `boxmc_length_delta` and `boxmc_shear_delta` until this rate is achieved. |
 
 ### BoxMC Initial Move Deltas
 
-These are the **starting values** for the box-move step sizes. The
-`BoxMCMoveSize` tuner adapts them automatically during equilibration toward
-`target_box_movement_acc_rate`.
+These are the **starting** values; the BoxMCMoveSize tuner will adapt them during equilibration.
 
-| Key | Type | Default | Example | Description |
-|-----|------|---------|---------|-------------|
-| `boxmc_volume_delta` | float | `0.1` | `0.1` | Max fractional volume change per volume move. |
-| `boxmc_volume_mode` | str | `"standard"` | `"standard"` | `"standard"` = linear ΔV; `"ln"` = logarithmic ΔV (better numerical stability at high density). |
-| `boxmc_length_delta` | float | `0.01` | `0.01` | Max length change per independent-length move (σ units). Applied equally to x, y, z. |
-| `boxmc_aspect_delta` | float | `0.02` | `0.02` | Max aspect-ratio scaling per aspect move. |
-| `boxmc_shear_delta` | float | `0.01` | `0.01` | Max tilt-factor change per shear move. Applied equally to xy, xz, yz. |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `boxmc_length_delta` | float | `0.001` | Initial maximum length change per independent-length move (in σ). Applied identically to Lx, Ly, Lz. |
+| `boxmc_shear_delta` | float | `0.001` | Initial maximum tilt-factor change per shear move. Applied identically to xy, xz, yz. |
 
-### BoxMCMoveSize Tuner Caps
+### BoxMCMoveSize Tuner Upper Bounds
 
-Upper bounds on the delta values that the `BoxMCMoveSize` tuner can set.
-These prevent the tuner from proposing unstably large box changes.
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `max_move_volume` | float | `0.1` | Cap on volume delta. |
-| `max_move_length` | float | `0.05` | Cap on per-axis length delta. |
-| `max_move_aspect` | float | `0.02` | Cap on aspect delta. |
-| `max_move_shear` | float | `0.02` | Cap on shear delta (xy, xz, yz). |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `max_move_length` | float | `0.01` | Hard ceiling on the length delta. The tuner cannot set it above this. |
+| `max_move_shear` | float | `0.01` | Hard ceiling on the shear delta. |
 
 ### SDF Pressure Compute
 
-The Scale Distribution Function (SDF) compute provides an equation-of-state
-cross-check during production. It is attached only after equilibration.
-
-| Key | Type | Default | Example | Description |
-|-----|------|---------|---------|-------------|
-| `enable_sdf` | bool | `true` | `true` | Attach `hoomd.hpmc.compute.SDF` after equilibration. Logs `betaP` and `Z = βP/ρ`. |
-| `sdf_xmax` | float | `0.02` | `0.02` | Upper limit of the SDF histogram. Use `0.02` for φ < 0.58; use `0.005` for very dense systems (φ > 0.58) where particles are near contact. |
-| `sdf_dx` | float | `1e-4` | `1e-4` | Histogram bin width. `1e-4` gives ~200 bins for `xmax=0.02`, which is sufficient for accurate extrapolation. Use `1e-5` near close-packing. |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `enable_sdf` | bool | `true` | Whether to attach the SDF pressure compute after equilibration. |
+| `sdf_xmax` | float | `0.02` | Upper limit of the SDF scale-factor histogram. Use `0.02` for φ < 0.58; use `0.005` for φ > 0.58 (near close-packing). |
+| `sdf_dx` | float | `1e-4` | SDF histogram bin width. With `xmax=0.02` and `dx=1e-4`, there are approximately 200 bins. Use `1e-5` near close-packing for higher resolution. |
 
 ### Hardware Selection
 
-| Key | Type | Required | Default | Description |
-|-----|------|----------|---------|-------------|
-| `use_gpu` | bool | ✓ | — | `true` attempts GPU initialisation; falls back to CPU if the GPU is unavailable. |
-| `gpu_id` | int | ✓ | — | CUDA device index (0-based). Only used when `use_gpu = true`. |
+| Key | Type | Example | Description |
+|---|---|---|---|
+| `use_gpu` | bool | `false` | `true` = use GPU device; `false` = use CPU. |
+| `gpu_id` | int | `0` | CUDA device index to use when `use_gpu` is `true`. Ignored for CPU runs. |
 
-### Output Filenames (single-stage mode)
+### Output Filenames (single-stage mode only)
 
-These keys are **only used when `stage_id_current = -1`**. In multi-stage mode
-all filenames are auto-generated as `<tag>_<stage_id>_<suffix>`.
+These keys are used only when `stage_id_current == -1`. In multi-stage mode, filenames are automatically generated from `tag` and `stage_id_current`.
 
-| Key | Default | Example | Description |
-|-----|---------|---------|-------------|
-| `output_trajectory` | `"npt_hpmc_output_traj.gsd"` | — | Trajectory GSD (append mode). |
-| `simulation_log_filename` | `"npt_hpmc_log.log"` | — | Main Table log. |
-| `box_log_filename` | `"box_npt_log.log"` | — | Box geometry Table log. |
-| `scalar_gsd_log_filename` | `"npt_hpmc_scalar_log.gsd"` | `"HOOMD_hard_cube_2197_hpmc_npt_P50_scalar_log.gsd"` | Scalar-only GSD log (no particle data). |
-| `restart_file` | `"npt_hpmc_restart.gsd"` | `"HOOMD_hard_cube_2197_hpmc_npt_P50_restart.gsd"` | Single-frame restart checkpoint. |
-| `final_gsd_filename` | `"npt_hpmc_final.gsd"` | `"HOOMD_hard_cube_2197_hpmc_npt_P50_final.gsd"` | Final configuration GSD. |
-
----
-
-## Output Files
-
-A complete run produces the following files in the working directory:
-
-| File | Frequency | Description |
-|------|-----------|-------------|
-| `<output_trajectory>` | every `traj_gsd_frequency` sweeps | Full per-particle GSD trajectory (positions, orientations, box). Opened in **append** mode — safe to restart. |
-| `<restart_file>` | every `restart_gsd_frequency` sweeps | Single-frame GSD checkpoint. Always overwritten (truncated). Use to resume after a crash or walltime limit. |
-| `<final_gsd_filename>` | once, at run end | Final configuration GSD. Suitable as input to the next pipeline stage. Contains `type_shapes` for OVITO visualisation. |
-| `<simulation_log_filename>` | every `log_frequency` sweeps | Human-readable Table log. Tab-separated columns: timestep, TPS, walltime, ETR, phi, volume, acceptance rates, move sizes, overlap count, SDF betaP (when enabled). |
-| `<box_log_filename>` | every `log_frequency` sweeps | Box geometry Table log. Columns: timestep, Lx, Ly, Lz, xy, xz, yz, volume, phi, cumulative BoxMC move counts. |
-| `<scalar_gsd_log_filename>` | every `log_frequency` sweeps | Scalar-only GSD log (no particle data). Very compact (~kilobytes per million steps). Analysable with `gsd.hoomd` without loading trajectory frames. |
-| `<tag>_stage<id>_npt_summary.json` | once, at run end | Machine-readable provenance JSON: all key parameters, final box geometry, packing fraction, overlap count, runtime. |
-| `random_seed.json` | once, on first run | Persistent RNG seed file. Re-used on restarts and later pipeline stages for reproducibility. |
-| `emergency_restart_<tag>.gsd` | on crash only | Emergency snapshot written if the simulation crashes. Preserves the last known configuration. |
-
-### Main Table Log Columns
-
-The `npt_hpmc_log.log` file has the following columns (exact header depends on
-HOOMD version):
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `timestep` | int | Current MC sweep |
-| `tps` | float | MC sweeps per wall-clock second |
-| `walltime` | float | Elapsed wall-clock seconds |
-| `Status/etr` | str | Estimated time remaining (HH:MM:SS) |
-| `Status/timestep` | str | `current/final` step fraction |
-| `MCStatus/trans_acc_rate` | float | Windowed translational acceptance rate |
-| `MCStatus/rot_acc_rate` | float | Windowed rotational acceptance rate |
-| `MoveSize/d` | float | Current translational move size |
-| `MoveSize/a` | float | Current rotational move size |
-| `Box/volume` | float | Current box volume |
-| `Box/phi` | float | Current packing fraction φ |
-| `HPMC/overlaps` | float | Overlap count (must be 0) |
-| `BoxMCStatus/acc_rate` | float | Combined box-move acceptance rate |
-| `BoxMCStatus/volume_acc_rate` | float | Volume+length move acceptance rate |
-| `BoxMCStatus/aspect_acc_rate` | float | Aspect move acceptance rate |
-| `BoxMCStatus/shear_acc_rate` | float | Shear move acceptance rate |
-| `SDF/betaP` | float | SDF-measured βP (production only; 0 during equil) |
-| `SDF/compressibility_Z` | float | Z = βP/ρ (production only) |
+| Key | Example |
+|---|---|
+| `output_trajectory` | `"..._output_traj.gsd"` |
+| `simulation_log_filename` | `"npt_hpmc_log.log"` |
+| `box_log_filename` | `"box_npt_log.log"` |
+| `scalar_gsd_log_filename` | `"..._scalar_log.gsd"` |
+| `restart_file` | `"..._restart.gsd"` |
+| `final_gsd_filename` | `"..._final.gsd"` |
 
 ---
 
-## Simulation Algorithm
+## 7. Detailed Workflow and Execution Sequence
 
-### Two-Phase Architecture
+The following is a complete, step-by-step account of what happens from the moment you launch the script to the moment it exits.
 
-The simulation executes in two phases that are architecturally distinct:
+### Step 1 — Command-line parsing
+
+The script requires exactly one argument: `--simulparam_file <path>`. Any other arguments cause an immediate exit with a usage message.
+
+### Step 2 — Parameter loading and validation
+
+`load_simulparams()` reads the JSON file, strips comment keys (those starting with `_`), type-checks all required keys against an internal `_REQUIRED_KEYS` dictionary, and constructs a `SimulationParams` dataclass. The dataclass's `validate()` method then checks all physical constraints (e.g., `equil_steps < total_num_timesteps`, all rates in (0, 1), all deltas > 0). Any failure exits immediately with a clear diagnostic message identifying the offending key and its actual value.
+
+### Step 3 — Stage-aware filename resolution
+
+`resolve_filenames()` inspects `stage_id_current`:
+- **Single-stage mode (`-1`)**: reads filenames directly from the JSON; warns if the final GSD already exists.
+- **Multi-stage mode (≥ 0)**: auto-generates filenames as `<tag>_<sid>_*.gsd/log`; hard-exits if the final GSD for the current stage already exists (indicating the stage already completed and should not be re-run); stage > 0 reads the previous stage's final GSD as its input.
+
+The input GSD must exist — the script exits with a clear `[FATAL]` message if it does not.
+
+### Step 4 — Random seed management
+
+`ensure_seed_file()` runs on **rank 0 only**. On the very first invocation, it generates a cryptographically secure integer in `[0, 65535]` using `secrets.randbelow()` and writes it to `random_seed.json` (single-stage) or `random_seed_stage_0.json` (multi-stage) along with a creation timestamp. On all subsequent calls — including restarts and later pipeline stages — the existing file is re-used unchanged, ensuring **full reproducibility** across job restarts.
+
+`read_seed()` then reads the seed back from disk and broadcasts it via `MPI.COMM_WORLD.bcast()` so all MPI ranks initialise HOOMD's RNG with identical state. Without this broadcast, different ranks would use different seeds and the simulation would be non-reproducible.
+
+### Step 5 — HOOMD device selection
+
+Based on `use_gpu` and `gpu_id`, a `hoomd.device.GPU` or `hoomd.device.CPU` object is created. On CPU, HOOMD uses OpenMP threading internally; on GPU, it uses CUDA. The device is logged to the console.
+
+### Step 6 — Simulation state initialisation
+
+A `hoomd.Simulation` object is created with the chosen device and the loaded seed.
+
+The script then follows a three-way decision tree for the initial state:
 
 ```
-Phase 1: EQUILIBRATION
-─────────────────────────────────────────────
- All tuners active:
-   • MoveSize tuner (translation)    ──────────────────────────────┐
-   • MoveSize tuner (rotation)       ──────────────────────────────┤  Continue into
-   • BoxMCMoveSize tuner  ──────────────────────── removed here    │  production
-                                                ↓                  │
- Runs in chunks of equil_steps_check_freq                          │
- After each chunk: poll box_tuner.tuned                            │
-   • True  → remove BoxMCMoveSize tuner, BREAK                     │
-   • False → continue (up to equil_steps total)                    │
-                                                                   │
-Phase 2: PRODUCTION                                                │
-─────────────────────────────────────────────                      │
- Box-move deltas FIXED (BoxMCMoveSize tuner removed)               │
- MoveSize tuners still active ─────────────────────────────────────┘
- SDF pressure compute ATTACHED
- sim.run(total_steps − equil_steps)   (single call)
+Does the restart GSD exist?
+  ├─ YES, and final GSD does NOT exist → RESUME:
+  │     sim.create_state_from_gsd(restart_gsd)
+  │     (picks up exactly where the job was interrupted)
+  │
+  └─ NO, or both exist → FRESH START:
+        rank 0 reads the last frame from input_gsd_filename
+        rank 0 broadcasts particle positions/orientations/box to all MPI ranks
+        all ranks reconstruct an identical hoomd.Snapshot
+        sim.create_state_from_snapshot(snapshot)
 ```
 
-### Equilibration Loop
+The MPI broadcast pattern for fresh starts is essential: GSD files must be read only on rank 0 to avoid filesystem contention, but all ranks need identical initial state for HOOMD's domain decomposition to work correctly.
+
+### Step 7 — Shape loading
+
+`load_convex_polyhedron_shape()` reads the shape JSON, extracts vertices as a NumPy array of shape `(N_vertices, 3)`, validates the shape (must have ≥ 4 vertices, must be 3D), and applies the scale factor. The scaled particle volume = `shape_scale³ × reference_volume`. It is stored back in `params.particle_volume` for use in all subsequent `φ` calculations.
+
+### Step 8 — HPMC integrator setup
+
+A `hoomd.hpmc.integrate.ConvexPolyhedron(nselect=1)` integrator is created with `nselect=1` (one particle attempted per step per sweep). The particle type `"A"` is assigned:
+- `mc.shape["A"]` = dictionary with the scaled vertex coordinates
+- `mc.d["A"]` = initial translational move size
+- `mc.a["A"]` = initial rotational move size
+
+A zero-step run `sim.run(0)` is immediately performed to force HOOMD to attach and initialise the integrator. The overlap count `mc.overlaps` is then checked — **it must be exactly 0**. Any non-zero count means the input configuration contains overlapping particles, which is physically invalid for a hard-particle simulation. The script exits with a fatal error if this check fails.
+
+### Step 9 — Logger and writer setup
+
+Six output streams are configured (see §10 for full output details):
+
+1. **Simulation Table log** (`npt_hpmc_log.log`): human-readable tab-separated text, written every `log_frequency` steps.
+2. **Box Table log** (`box_npt_log.log`): box geometry (Lx, Ly, Lz, xy, xz, yz, φ), written every `log_frequency` steps.
+3. **Trajectory GSD** (`*_output_traj.gsd`): full per-particle frames (positions, orientations, type_shapes), written every `traj_gsd_frequency` steps, in **append mode** so restarts extend the same file.
+4. **Restart GSD** (`*_restart.gsd`): single-frame checkpoint, written every `restart_gsd_frequency` steps, **truncated** (overwriting the previous checkpoint to keep the file small).
+5. **Scalar GSD log** (`*_scalar_log.gsd`): compact GSD storing only logged scalars (no particle data) via `filter=Null()`. Ideal for fast post-processing that needs time series of φ, acceptance rates, etc., without reading large trajectory frames.
+6. **Shape logger**: a separate logger that embeds `type_shapes` (the vertex list of the polyhedron) directly into trajectory GSD frames so the file is self-describing.
+
+### Step 10 — BoxMC updater setup
+
+`hoomd.hpmc.update.BoxMC` is configured with:
+- `betaP = Constant(params.pressure)` — the target reduced pressure
+- `trigger = Periodic(npt_freq)` — fires every `npt_freq` sweeps
+- `boxmc.length`: independent Lx/Ly/Lz length moves with `delta = (length_delta, length_delta, length_delta)`
+- `boxmc.shear`: xy/xz/yz tilt-factor moves with `delta = (shear_delta, shear_delta, shear_delta)` and `reduce=0.0` (no Lees-Edwards reduction)
+
+### Step 11 — Tuner setup
+
+Three tuners are attached:
+
+1. **`MoveSize` tuner for translation** (trigger: `Periodic(trans_move_size_tuner_freq)`): adjusts `mc.d["A"]` to achieve `target_particle_trans_move_acc_rate`, capped at `max_translation_move`.
+2. **`MoveSize` tuner for rotation** (trigger: `Periodic(rot_move_size_tuner_freq)`): adjusts `mc.a["A"]` to achieve `target_particle_rot_move_acc_rate`, capped at `max_rotation_move`.
+3. **`BoxMCMoveSize` tuner** (trigger: `Periodic(box_tuner_freq)`): adjusts `boxmc.length["delta"]` and `boxmc.shear["delta"]` to achieve `target_box_movement_acc_rate`, capped at `max_move_length` and `max_move_shear`. **This tuner is always removed before production begins.**
+
+### Step 12 — Equilibration loop
+
+See §8 for full details.
+
+### Step 13 — BoxMCMoveSize tuner removal
+
+Regardless of whether the tuner converged, it is **always removed** before production. A hard safety guard enforces this — the script calls `fail_with_context()` and exits if the tuner is found to still be attached after the equilibration block.
+
+### Step 14 — SDF compute attachment
+
+If `enable_sdf: true`, `hoomd.hpmc.compute.SDF` is attached **after** equilibration. The SDF method requires a stable box — attaching it during the large volume fluctuations of early equilibration would produce meaningless pressure readings (see §16).
+
+### Step 15 — Production run
+
+`sim.run(prod_steps)` runs the remaining `total_num_timesteps - equil_steps` sweeps. All writers (trajectory, restart, scalar log, table logs) continue to fire. Move sizes are now fixed. The SDF compute samples the instantaneous pressure.
+
+### Step 16 — Final outputs
+
+`write_final_outputs()` writes:
+1. A final single-frame GSD (`*_final.gsd`) — the last configuration, suitable as input to the next pipeline stage.
+2. A machine-readable summary JSON (`<tag>_stage<id>_npt_summary.json`) recording all key parameters, final box geometry, final φ, overlap count, box tuning result, runtime, and the path to the parameter file.
+3. A formatted console banner summarising the run.
+
+### Step 17 — Cleanup (always runs)
+
+The `finally` block flushes and closes the two Table log file handles unconditionally — even if an exception was raised during the run. This prevents partial/unclosed log files.
+
+---
+
+## 8. Equilibration Phase — In Depth
+
+### Purpose
+
+Equilibration serves two goals:
+1. **Relax the initial configuration** — the input GSD may come from a different pressure, so the box needs to explore the new equilibrium density.
+2. **Tune move sizes** — the particle MoveSize tuners adjust d and a to hit the target particle acceptance rate; the BoxMCMoveSize tuner adjusts box move amplitudes.
+
+### Loop Structure
+
+The equilibration runs for `equil_steps` total sweeps, broken into chunks of `equil_steps_check_freq` sweeps each:
+
+```
+n_chunks = equil_steps // equil_steps_check_freq
+         = 5,000,000  // 5,000
+         = 1,000 chunks
+```
+
+For each chunk, `sim.run(equil_steps_check_freq)` is called. All three tuners fire automatically inside each chunk (they have their own periodic triggers). After each chunk:
+
+1. φ is recomputed from the current box volume.
+2. The current BoxMC move state (deltas, acceptance rates, absolute error vs. target) is captured.
+3. If this state is closer to the target acceptance rate than any previously seen state, it is saved as `best_box_move_state`.
+4. If `box_tuner.tuned == True`, the loop breaks early.
+
+### BoxMCMoveSize Convergence Logic
+
+The tuner declares `tuned = True` when all box-move deltas produce acceptance rates within its internal tolerance of the target. When this happens:
+- The current move sizes are kept.
+- The tuner is removed immediately.
+- `box_tuner_converged = True` is recorded.
+
+### Non-Convergence Fallback
+
+If the tuner does not converge within all `n_chunks` equilibration chunks:
+- The script recalls which chunk produced the box acceptance rate **closest to the target** (minimum |measured_rate − target_rate|).
+- Box move sizes are **restored** to that best-observed state.
+- The tuner is removed anyway.
+- A `[WARNING]` is printed with the restored deltas and acceptance rates.
+
+This fallback ensures the simulation proceeds sensibly rather than crashing. The production phase will use whatever box move sizes were judged best, even if they are not perfectly tuned.
+
+### Per-Chunk Console Output
+
+Each equilibration chunk prints one diagnostic line to stdout:
+```
+[EQUIL chunk 42/1000] step=210000 | phi=0.62314 | box_tuner.tuned=False |
+  box_acc=0.28411 | len_acc=0.31200 | shr_acc=0.25600 |
+  len_moves=1240,2760,4000 | shr_moves=1024,2976,4000 | box_moves=2264,5736,8000 |
+  target_gap=0.01589 | best_gap=0.00821 | length_delta=(0.00312,...) |
+  shear_delta=(0.00289,...) | d=0.04512 | a=0.08314
+```
+
+All columns are defined in the [Glossary (§22)](#22-glossary).
+
+---
+
+## 9. Production Phase — In Depth
+
+Production begins immediately after the equilibration loop exits and the BoxMCMoveSize tuner is confirmed removed.
+
+- **Steps**: `prod_steps = total_num_timesteps − equil_steps` = 45,000,000 in the example.
+- **Move sizes**: Fixed. Particle MoveSize tuners are **still attached** (they continue to fine-tune d and a during production — this is intentional and standard practice).
+- **Box moves**: Fixed. BoxMC still fires every `npt_freq` sweeps, but its move amplitudes are now frozen.
+- **SDF compute**: Active. `sdf.betaP` is logged every `log_frequency` sweeps.
+- **All writers**: Active.
+
+> **Why are particle MoveSize tuners kept during production but box tuner removed?**
+>
+> The particle move tuners adjust d and a in response to slowly drifting density (as the box equilibrates). Keeping them active is harmless and beneficial — the particle acceptance rate remains near the target throughout production. The BoxMCMoveSize tuner is different: HOOMD's documentation states it continues tuning even after `tuned = True`, so leaving it attached would continuously modify the box step size and corrupt the NPT ensemble statistics. It is therefore removed unconditionally.
+
+---
+
+## 10. Output Files — Complete Reference
+
+### `npt_hpmc_log.log` — Simulation Table Log
+
+Human-readable tab-separated text file. One row per `log_frequency` steps.
+
+Columns:
+| Column | Description |
+|---|---|
+| `Simulation/timestep` | Current MC sweep number |
+| `Simulation/tps` | Timesteps per second (performance metric) |
+| `Simulation/walltime` | Elapsed wall-clock seconds |
+| `Status/etr` | Estimated time remaining as `HH:MM:SS.ffffff` |
+| `Status/timestep` | `current_step/final_step` fraction string |
+| `MCStatus/trans_acc_rate` | Windowed translational acceptance rate |
+| `MCStatus/rot_acc_rate` | Windowed rotational acceptance rate |
+| `MoveSize/d` | Current translational move size |
+| `MoveSize/a` | Current rotational move size |
+| `Box/volume` | Current simulation box volume |
+| `Box/phi` | Current packing fraction φ |
+| `HPMC/overlaps` | Particle overlap count (must be 0) |
+| `BoxMCStatus/acc_rate` | Windowed combined box acceptance rate |
+| `BoxMCStatus/length_acc_rate` | Windowed length-move acceptance rate |
+| `BoxMCStatus/shear_acc_rate` | Windowed shear-move acceptance rate |
+| `BoxMCStatus/length_moves` | Windowed length counts: `accepted,rejected,total` |
+| `BoxMCStatus/shear_moves` | Windowed shear counts: `accepted,rejected,total` |
+| `BoxMCStatus/combined_moves` | Windowed combined box counts |
+
+### `box_npt_log.log` — Box Geometry Log
+
+Human-readable tab-separated text. Same trigger as simulation log.
+
+Columns: `timestep`, `Lx`, `Ly`, `Lz`, `xy`, `xz`, `yz`, `volume_str`, `phi`.
+
+### `*_output_traj.gsd` — Full Trajectory
+
+Multi-frame GSD file. Each frame contains all N particle positions, orientations, and the box geometry. Opened in **append mode (`"ab"`)** so that restarted jobs extend the same trajectory file rather than overwriting it.
+
+Use with OVITO, freud, or gsd Python library for visualisation and analysis.
 
 ```python
-n_chunks = equil_steps // equil_steps_check_freq
-
-for chunk_idx in range(n_chunks):
-    sim.run(equil_steps_check_freq)
-    if box_tuner.tuned:
-        sim.operations.tuners.remove(box_tuner)
-        break   # early exit
+import gsd.hoomd
+with gsd.hoomd.open("HOOMD_hard_..._output_traj.gsd") as f:
+    frame = f[-1]   # last frame
+    positions = frame.particles.position
+    orientations = frame.particles.orientation
+    box = frame.configuration.box
 ```
 
-Each `sim.run(equil_steps_check_freq)` call internally executes all attached
-operations (integrator, BoxMC updater, MoveSize tuners, BoxMCMoveSize tuner,
-writers) on their respective `Periodic` triggers. No manual tuner calls are needed.
+### `*_restart.gsd` — Restart Checkpoint
 
-The `BoxMCMoveSize` tuner declares `tuned = True` when **all** of the following
-conditions hold simultaneously:
-- All 8 box-move types (`volume`, `length_x`, `length_y`, `length_z`,
-  `aspect`, `shear_x`, `shear_y`, `shear_z`) have acceptance rates within
-  ±`tol` (= 0.03) of `target_box_movement_acc_rate`.
+Single-frame GSD, **always overwritten** (`truncate=True`, mode `"wb"`). Contains the most recent configuration. If the job is interrupted, the next run detects this file and resumes from it (see §13).
 
-**What happens if the tuner does not converge?**
+### `*_final.gsd` — Final Configuration
 
-If the tuner has not converged after all `n_chunks` equilibration chunks, a
-`[WARNING]` is printed and production runs with the `BoxMCMoveSize` tuner still
-active. The run is still physically valid but box-move sizes may not be optimal.
-Increase `equil_steps` or reduce `box_tuner_freq` (fire tuner more often) to
-address this.
+Single-frame GSD written once at the end of production. This is the authoritative endpoint of the run and is used as the `input_gsd_filename` for the next stage in a pressure-ramp pipeline.
 
-### Production Run
+### `*_scalar_log.gsd` — Scalar-Only GSD Log
 
-Production runs as a **single** `sim.run(prod_steps)` call with:
-- No `BoxMCMoveSize` tuner (box-move deltas locked).
-- MoveSize tuners still active (particle move sizes continue to track acceptance rate).
-- SDF pressure compute active.
-- All writers (trajectory GSD, restart GSD, Table logs) firing on their triggers.
+GSD written with `filter=Null()` (no particle data), opened in **append mode**. Contains only logged scalar quantities at every `log_frequency` step. This file is extremely small compared to the trajectory and is ideal for quickly extracting time series of φ, pressure, acceptance rates, and TPS using:
 
-### SDF Pressure Attachment
+```python
+import gsd.hoomd
+with gsd.hoomd.open("..._scalar_log.gsd") as f:
+    phi_series = [f[i].log["Box/phi"] for i in range(len(f))]
+```
 
-The SDF compute is constructed during `build_simulation()` but is **not attached**
-at that time. It is attached by the caller (in `main()`) immediately after the
-`BoxMCMoveSize` tuner is removed and before `sim.run(prod_steps)`. This ensures:
+### `<tag>_stage<id>_npt_summary.json` — Provenance Summary
 
-1. The SDF histogram is accumulated only in the post-equilibration, fixed-box regime.
-2. The SDF extrapolation is not contaminated by large volume fluctuations from
-   the early equilibration phase.
+Machine-readable JSON written once at the end of the run. Contains:
+- All key parameters (tag, pressure, N, shape, scale, particle volume)
+- Final box geometry (Lx, Ly, Lz, xy, xz, yz)
+- Final packing fraction
+- Final overlap count (must be 0)
+- Final timestep
+- Random seed
+- Box tuning result (whether the tuner converged, which state was selected, best/selected deltas)
+- Runtime in seconds
+- Timestamp
+
+This file is invaluable for pipeline bookkeeping — you can verify a run completed correctly, and at what pressure, without opening any binary GSD file.
+
+### `random_seed.json` / `random_seed_stage_0.json` — Persistent Seed
+
+Written once on the first run; re-read on all subsequent restarts. Contains the seed integer and a creation timestamp. **Do not delete this file** unless you intend to generate a new independent trajectory.
+
+### `emergency_restart_<tag>.gsd` — Emergency Snapshot (on crash only)
+
+If an unexpected exception is caught during the main simulation loop, the exception handler attempts to write this file before re-raising. It is identical in format to the restart GSD and allows you to inspect the last known good state after a crash.
 
 ---
 
-## Multi-Stage Pipeline Mode
+## 11. Multi-Stage Pipeline Mode
 
-For long runs that exceed walltime limits, or for systematic pressure sweeps,
-the code supports a chained multi-stage pipeline controlled by `stage_id_current`.
+Hard-polyhedra NPT simulations are commonly run as a **pressure ramp**: starting from a dilute configuration, the pressure is incrementally increased across many stages to densify the system and locate phase transitions. The multi-stage mode (`stage_id_current >= 0`) automates this pipeline.
 
 ### How It Works
 
-Set `stage_id_current = 0` for the first stage, `1` for the second, and so on.
-All output files are automatically prefixed with `<tag>_<stage_id>_`:
+1. **Stage 0**: reads `input_gsd_filename` from the JSON; writes `<tag>_0_final.gsd`.
+2. **Stage 1**: automatically reads `<tag>_0_final.gsd` as its input; writes `<tag>_1_final.gsd`.
+3. **Stage N**: automatically reads `<tag>_{N-1}_final.gsd` as its input; writes `<tag>_N_final.gsd`.
+
+Between stages, you only need to increment `stage_id_current` in the JSON (and optionally change `pressure`). The script hard-exits if the target stage's final GSD already exists, preventing accidental overwrites.
+
+### Running a Pressure Ramp
 
 ```
-stage 0: <tag>_0_traj.gsd, <tag>_0_sim.log, <tag>_0_final.gsd, ...
-stage 1: <tag>_1_traj.gsd, <tag>_1_sim.log, <tag>_1_final.gsd, ...
+Stage 0: pressure=50  → P50_0_final.gsd
+Stage 1: pressure=60  → P60_1_final.gsd
+Stage 2: pressure=70  → P70_2_final.gsd
+...
 ```
 
-Stage 0 reads `input_gsd_filename` from the JSON. Stages 1, 2, ... automatically
-read `<tag>_<stage_id-1>_final.gsd` as input — no manual filename updates needed.
+Each stage can use a different JSON file with different `pressure` and `equil_steps` values, while keeping the same `tag` to maintain the chain.
 
-### Safety Guards
+### Seed Persistence Across Stages
 
-The code prevents accidental overwriting or skipping stages:
-
-- If `<tag>_<sid>_final.gsd` **already exists**: the script exits with an error
-  telling you to increment `stage_id_current` to `sid + 1`.
-- If the previous stage's final GSD **does not exist**: the script exits telling
-  you that stage `sid - 1` did not complete.
-
-### Example: Three-Stage Pressure Ramp
-
-```json
-// Stage 0: equilibrate at βP = 30
-{"stage_id_current": 0, "pressure": 30, "equil_steps": 5000000, ...}
-
-// Stage 1: compress to βP = 50 starting from stage 0 output
-{"stage_id_current": 1, "pressure": 50, "input_gsd_filename": "..." ...}
-
-// Stage 2: long production at βP = 50 starting from stage 1 output
-{"stage_id_current": 2, "pressure": 50, "equil_steps": 1000000, "total_num_timesteps": 100000000, ...}
-```
-
-The `input_gsd_filename` is only used for stage 0; subsequent stages chain
-automatically.
+In multi-stage mode, `random_seed_stage_0.json` is created once at stage 0 and reused for all later stages. This gives a single persistent seed for the entire pipeline.
 
 ---
 
-## MPI Parallel Execution
+## 12. MPI Parallel Execution
 
-The code is designed for transparent scaling from 1 to hundreds of MPI ranks.
+HOOMD-blue implements domain decomposition MPI parallelism. The simulation box is divided into N_ranks subdomains; each MPI rank owns the particles in its subdomain and exchanges ghost particles at boundaries with neighbouring ranks.
 
-### MPI-Safe Snapshot Loading
+### Invocation
 
-Raw GSD reads on all N ranks simultaneously would cause N concurrent reads of
-the same file — unreliable on parallel filesystems (Lustre, GPFS). Instead the
-code uses a **read-on-root, broadcast** pattern:
-
-```
-Rank 0: open GSD → read last frame → pack into dict → bcast(dict) → reconstruct snapshot
-Rank 1–N: bcast(None) → receive dict → reconstruct snapshot
-All ranks: sim.create_state_from_snapshot(snapshot)  [HOOMD decomposes internally]
+```bash
+mpirun -n 8 python HOOMD_hard_polyhedra_NPT_v6.py \
+    --simulparam_file simulparam_hard_polyhedra_npt_v6.json
 ```
 
-This pattern is also used for restart runs where HOOMD's built-in
-`create_state_from_gsd` handles the MPI decomposition internally.
+### Rank 0 Behaviour
 
-### Console Output
+All console output (`root_print`), file creation (seed file, summary JSON), and GSD-reading for fresh starts are performed exclusively on **rank 0**. The `_is_root_rank()` function determines rank using three environment variables in order of precedence: `OMPI_COMM_WORLD_RANK` (OpenMPI), `PMI_RANK` (MPICH/Slurm PMI), `SLURM_PROCID` (Slurm-native). This fallback chain works before MPI is fully initialised.
 
-All `root_print()` and `debug_kv()` calls are gated on `_is_root_rank()` so
-each INFO/WARNING/DEBUG line appears exactly once regardless of the number of
-MPI ranks. The rank is determined from environment variables
-(`OMPI_COMM_WORLD_RANK`, `PMI_RANK`, `SLURM_PROCID`) rather than from mpi4py
-so it is available even before MPI is fully initialised.
+### GSD Loading for Fresh Starts
 
-### File Writes
+Rank 0 reads the last frame from the input GSD and creates a Python dictionary with positions, orientations, and box data. This dictionary is broadcast to all ranks via `MPI.COMM_WORLD.bcast()`. All ranks then reconstruct an identical `hoomd.Snapshot` and call `sim.create_state_from_snapshot()`. HOOMD internally partitions the particles into its MPI domains.
 
-All file I/O (GSD writes, log file writes, seed file creation, summary JSON) is
-performed exclusively on rank 0. The `_is_root_rank()` guard prevents N-fold
-file conflicts.
+### mpi4py Stub
 
-### MPI Stub
-
-If `mpi4py` is not installed, a transparent `_MPIStub` class is used. Its
-`bcast()` method returns the input object unchanged, making all downstream
-broadcast calls work identically in serial mode without any code changes.
+If `mpi4py` is not installed, a minimal `_MPIStub` class is used that provides a `COMM_WORLD.bcast()` no-op (returns the object unchanged). This means the exact same code path works correctly for serial runs — `bcast` is called but has no effect.
 
 ---
 
-## Restart and Crash Recovery
+## 13. Restart and Recovery
 
-### Normal Restart (walltime limit)
+### Automatic Restart Detection
 
-The restart GSD (`<restart_file>`) is a single-frame GSD written every
-`restart_gsd_frequency` sweeps with `truncate=True`, so it always contains
-exactly the most recent configuration.
-
-To resume a run after a walltime interruption, simply resubmit the same job
-with the same parameter file. The script will detect the restart GSD and call
-`sim.create_state_from_gsd(filename=restart_gsd)` instead of the
-read-broadcast-reconstruct path:
+At the beginning of `build_simulation()`, the script checks for the presence of the restart GSD file:
 
 ```
-Restart GSD exists AND Final GSD does NOT exist → RESTART PATH
-Restart GSD does NOT exist OR Final GSD exists  → FRESH RUN PATH
+if restart_gsd EXISTS and final_gsd does NOT EXIST:
+    resume from restart_gsd
+else:
+    fresh start from input_gsd
 ```
 
-The restart GSD records the HOOMD timestep, so the continued run picks up
-exactly where it left off.
+The `final_gsd` check prevents accidentally resuming a completed run — if both the restart and final GSD exist, the run is considered complete and a fresh start is performed from `input_gsd_filename`.
 
-### Crash Recovery
+### How Restarted Runs Work
 
-If the simulation crashes with an unexpected exception (Python error, HOOMD
-assertion, memory error, etc.), the exception handler in `main()` attempts to:
+- The restart GSD contains the last checkpointed configuration (positions, orientations, box, timestep counter).
+- HOOMD reads the timestep from the GSD and continues counting from there.
+- All writers re-open their files in append mode — the trajectory GSD extends from where it left off.
+- Move sizes from the restart GSD's embedded state are used as the starting point for re-tuning.
 
-1. Print a structured diagnostic block showing the last known timestep, box
-   geometry, all filenames, the MPI rank, and the seed.
-2. Write an **emergency snapshot** named `emergency_restart_<tag>.gsd` using the
-   last known simulation state.
+### Handling Corrupted Restart Files
 
-The emergency snapshot can be used as an `input_gsd_filename` after fixing the
-cause of the crash.
+If the restart GSD is corrupted (e.g., from a hard kill mid-write), the `create_state_from_gsd()` call will fail. The error message includes the hint: "Restart GSD may be corrupted. Delete it to start fresh." Deleting the restart GSD forces a fresh start from `input_gsd_filename`.
 
-### Seed Persistence
+### Emergency Snapshot on Crash
 
-The random seed file (`random_seed.json` or `random_seed_stage_0.json`) is
-written once on the first run and **never overwritten**. All restarts and later
-pipeline stages read the same seed, ensuring that the combined trajectory is
-statistically equivalent to a single uninterrupted run with that seed.
+If the main simulation loop raises an unexpected exception (bug, out-of-memory, etc.), the exception handler writes `emergency_restart_<tag>.gsd`. This captures the last known good particle state and allows post-mortem analysis.
 
 ---
 
-## Code Architecture
+## 14. Logged Quantities Reference
 
-### Section Map
+### Windowed vs. Cumulative Rates
 
-The script is organised into 12 labelled sections:
+HOOMD's HPMC counters are **cumulative** — they grow monotonically from the start of a `sim.run()` call. To provide meaningful per-interval acceptance rates in the log, the custom loggable classes (`MCStatus`, `BoxMCStatus`) compute **windowed** rates: at each logging event, they subtract the previous cumulative counts from the current ones to get the number of moves in the current window.
 
-| Section | Content |
-|---------|---------|
-| 1 | MPI-aware console helpers (`root_print`, `fail_with_context`, `debug_kv`) |
-| 2 | Custom loggable classes (`Status`, `MCStatus`, `Box_property`, `MoveSizeProp`, `BoxMCStatus`, `BoxSeqProp`, `OverlapCount`, `SDFPressure`) |
-| 3 | `SimulationParams` dataclass with `validate()` |
-| 4 | JSON loading: `load_simulparams()`, `_REQUIRED_KEYS`, `_OPTIONAL_KEYS` |
-| 5 | Seed management: `ensure_seed_file()`, `read_seed()` |
-| 6 | Filename resolution: `RunFiles` dataclass, `resolve_filenames()` |
-| 7 | Shape loader: `load_convex_polyhedron_shape()`, `_get_json_value_by_suffix()` |
-| 8 | MPI snapshot loading: `load_and_broadcast_snapshot()`, `reconstruct_snapshot()` |
-| 9 | Simulation builder: `build_simulation()` — steps 9.1–9.17 |
-| 10 | Output helpers: `_write_snapshot()`, `write_final_outputs()`, `_print_banner()` |
-| 11 | Entry point: `main()` — equilibration loop, production run, exception handler |
-| 12 | Script guard: `if __name__ == "__main__"` with traceback handler |
+The cache-per-timestep design of `BoxMCStatus._refresh_cache()` ensures all six logged BoxMC quantities (three rates + three count strings) are computed from the same window, preventing the window from being consumed by the first property getter and leaving zeros for the rest.
 
-### Custom Loggable Classes
+### ETR (Estimated Time Remaining)
 
-HOOMD's `Logger` can register any Python object whose properties are enumerated
-in a class-level `_export_dict`. The dict maps `property_name → (category, True)`.
-
-| Class | Properties logged | Purpose |
-|-------|------------------|---------|
-| `Status` | `etr`, `timestep_fraction` | ETR string and step progress |
-| `MCStatus` | `translate_acceptance_rate`, `rotate_acceptance_rate` | Windowed particle acceptance rates |
-| `Box_property` | `L_x/y/z`, `XY/XZ/YZ`, `volume`, `packing_fraction` | Box geometry and φ |
-| `MoveSizeProp` | `d`, `a` | Current move sizes |
-| `BoxMCStatus` | `acceptance_rate`, `volume/aspect/shear_acc_rate` | Windowed BoxMC acceptance rates |
-| `BoxSeqProp` | `volume/aspect/shear_moves_str` | Cumulative BoxMC counts as strings |
-| `OverlapCount` | `overlap_count` | Live overlap check |
-| `SDFPressure` | `betaP`, `compressibility_Z` | SDF pressure and Z-factor |
-
-**Guard-property pattern:** HOOMD's Logger calls every registered property getter
-**once at registration time** to validate the loggable — before any `sim.run()`
-call. Therefore every property getter in this codebase guards against
-`hoomd.error.DataAccessError` (HPMC counters not yet initialised) and
-`ZeroDivisionError` (TPS = 0 before any sweeps), returning a safe fallback value
-(typically `0.0` or `"0/?"`) rather than raising.
-
-**Windowed acceptance rates:** HOOMD's counters (`translate_moves`,
-`rotate_moves`, `volume_moves`, etc.) are cumulative totals from the start of
-the run. Logging their ratio directly would produce a monotonically converging
-curve that masks per-window trends. `MCStatus` and `BoxMCStatus` store the
-previous counter values and compute the acceptance fraction only over the most
-recent logging window (delta_accepted / delta_total).
-
-**Cache design in `BoxMCStatus`:** During a single logging event, HOOMD may
-query all four properties (`acceptance_rate`, `volume_acc_rate`,
-`aspect_acc_rate`, `shear_acc_rate`) in rapid succession. The
-`_refresh_cache()` method computes all rates together at most once per
-`sim.timestep` value and caches them, so that all four properties return
-internally consistent values from the same delta window regardless of query
-order.
-
-### MPI-Safe Snapshot Loading
-
-The three functions involved are:
-
-```python
-snap_data = load_and_broadcast_snapshot(input_gsd, comm, rank)
-# rank 0: reads GSD, validates arrays, packs into dict, broadcasts
-# rank 1+: receives None, which bcast replaces with the broadcast dict
-
-snapshot = reconstruct_snapshot(snap_data, rank)
-# rank 0: validates shapes, builds hoomd.Snapshot, populates arrays
-# rank 1+: returns empty hoomd.Snapshot() (HOOMD fills from rank 0)
-
-sim.create_state_from_snapshot(snapshot)
-# all ranks: HOOMD performs domain decomposition internally
+The `Status` class computes:
 ```
-
-### Random Seed Management
-
+ETR = (final_timestep − current_timestep) / current_tps
 ```
-First run:
-  ensure_seed_file() [rank 0] → generate secrets.randbelow(65536) → write JSON
-  all ranks wait (poll with 30-second timeout) → read_seed() → pass to Simulation()
+where `tps` is HOOMD's measured timesteps-per-second. This is formatted as `HH:MM:SS.ffffff`. Before the first `sim.run()` call, `tps = 0` would cause division by zero — this is caught and returns 0.0 (formatting as `0:00:00`).
 
-Restart or later stage:
-  ensure_seed_file() [rank 0] → file exists, no-op
-  read_seed() → same seed as before → reproducible trajectory
-```
+### Overlap Count
 
-The seed is in [0, 65535] to fit HOOMD's uint16 RNG seed requirement.
+`OverlapCount` logs `mc.overlaps` at every logging event. In a physically valid hard-particle simulation, this must always be 0. Seeing any non-zero value in the log file is a sign of a serious bug and should be investigated immediately.
 
 ---
 
-## Analysing the Output
+## 15. Custom Loggable Classes — Internal Design
 
-### Reading the Table Log
+The script defines six custom loggable classes. All share the same interface:
 
-```python
-import numpy as np
+1. A `_export_dict` class variable mapping property names to `(category, default)` tuples, allowing HOOMD's Logger to autodiscover them.
+2. Properties (Python `@property` decorated methods) that return the logged value.
+3. Guards against `DataAccessError` — HOOMD validates loggables by calling their property getters *at registration time*, before any `sim.run()` call has initialised the counters. Every getter returns a safe default value (0.0 or `"0/?"`) when the counter is not yet available.
 
-data = np.genfromtxt("npt_hpmc_log.log", names=True, delimiter="\t")
-phi      = data["Box_phi"]
-timestep = data["timestep"]
-betaP    = data["SDF_betaP"]
+| Class | Logged Properties | Notes |
+|---|---|---|
+| `Status` | `timestep_fraction`, `etr` | String-type; tracks run progress |
+| `MCStatus` | `translate_acceptance_rate`, `rotate_acceptance_rate` | Windowed scalar rates |
+| `BoxMCStatus` | `acceptance_rate`, `length_acc_rate`, `shear_acc_rate`, `length_moves_str`, `shear_moves_str`, `combined_moves_str` | Windowed; cached per timestep |
+| `BoxSeqProp` | `length_moves_str`, `shear_moves_str`, `combined_moves_str` | Raw cumulative counts for box log |
+| `OverlapCount` | `overlap_count` | Sanity check; must be 0 |
+| `SDFPressure` | `betaP`, `compressibility_Z` | Active only during production; returns 0.0 on non-root ranks |
 
-import matplotlib.pyplot as plt
-plt.plot(timestep, phi)
-plt.xlabel("MC sweep")
-plt.ylabel("Packing fraction φ")
-plt.title("Hard cubes NPT φ vs step")
-plt.savefig("phi_vs_step.png", dpi=150)
+---
+
+## 16. SDF Pressure Estimator
+
+### Theory
+
+The **Scale Distribution Function (SDF)** method (Anderson et al., *J. Comput. Phys.* 2016, 325, 74–97) computes the instantaneous pressure of a hard-particle system without any additional moves. For each particle, HOOMD measures the smallest scale factor `x` by which that particle would need to be uniformly expanded to just touch its nearest neighbour. The histogram of these `x` values is `s(x)`.
+
+The dimensionless pressure is:
+```
+βP = ρ · (1 + s(0⁺) / 6)
+```
+where `ρ = N/V` is the number density and the denominator `6 = 2d` with `d=3` dimensions.
+
+The compressibility factor logged by `SDFPressure.compressibility_Z` is:
+```
+Z = βP/ρ = βPV/N
+```
+which equals 1 for an ideal gas and increases with density for hard particles.
+
+### Parameter Choices
+
+- `sdf_xmax = 0.02`: suitable for packing fractions below ~0.58. Captures enough of the `s(x)` distribution to accurately extrapolate to `x = 0`.
+- `sdf_xmax = 0.005`: for packing fractions above 0.58 (dense / near-crystalline). Particles are so close that very small scale factors already cause overlaps; a smaller `xmax` is needed.
+- `sdf_dx = 1e-4`: gives ~200 bins with `xmax=0.02`. More bins = more accurate extrapolation but more memory.
+- `sdf_dx = 1e-5`: near close-packing. ~200 bins at `xmax=0.005`.
+
+### Why Attached After Equilibration
+
+The SDF assumes the box is fixed during measurement. During equilibration, BoxMC proposes large box changes; `s(x)` during these fluctuations is dominated by the box movement rather than the equilibrium contact distribution. By waiting until the BoxMCMoveSize tuner converges and the box has settled near the equilibrium density, the SDF measurements reflect the true equation-of-state pressure.
+
+During production, the time-averaged `<βP>` from SDF should converge to the target `pressure` parameter — this is a built-in self-consistency check of the simulation.
+
+---
+
+## 17. Random Seed Management
+
+HOOMD's HPMC integrator uses a single integer seed in `[0, 65535]` to initialise its internal Xoshiro256** pseudorandom number generator. This seed determines the entire trajectory of Monte Carlo moves.
+
+### Reproducibility
+
+The seed is generated once using `secrets.randbelow(65536)` (a cryptographically secure source, guaranteed to be unbiased) and written to `random_seed.json`. All subsequent restarts, whether from an interrupted job or a deliberate restart, read the same seed. This means:
+
+- **The same trajectory is reproduced** if you start from the same input GSD with the same seed.
+- **Independent replicas** require deleting `random_seed.json` before each new run to generate a fresh seed.
+
+### MPI Safety
+
+The seed file is written only by rank 0. A polling loop (timeout: 30 seconds) on all ranks waits for the file to appear on the shared filesystem before reading it. This prevents a race condition where rank > 0 attempts to read the file before rank 0 has finished writing it.
+
+---
+
+## 18. Error Handling and Crash Recovery
+
+The script is designed to fail loudly and informatively rather than silently or with cryptic Python tracebacks.
+
+### `fail_with_context()`
+
+Every fatal error path calls this function, which prints a structured multi-line message:
+```
+[FATAL] Shape JSON file not found.
+  shape_json_filename: /data/nonexistent.json
+  cwd: /home/user/sim
+```
+Then calls `sys.exit()`. This is far more useful than a raw `FileNotFoundError` traceback when debugging on a cluster where you may not see the full output.
+
+### Exception Handler in `main()`
+
+The entire simulation is wrapped in a `try/except/finally` block:
+- **`try`**: builds and runs the simulation.
+- **`except Exception`**: catches any unexpected error, prints the exception type and message, prints the last known simulation state (timestep, N, box geometry), and attempts to write `emergency_restart_<tag>.gsd` before re-raising the exception.
+- **`finally`**: always flushes and closes log file handles, and prints total runtime.
+
+### Re-raising
+
+The exception handler re-raises the original exception after logging context. The top-level `if __name__ == "__main__"` block catches this, prints a full traceback, and exits with code 1. This ensures the job scheduler correctly identifies the job as failed.
+
+---
+
+## 19. Tuning Strategy and Acceptance Rate Targets
+
+### Why 30% (0.3)?
+
+A translational/rotational acceptance rate of 0.2–0.3 is the empirical sweet spot for hard-particle HPMC:
+- Too high (> 0.5): moves are tiny, the system diffuses very slowly, and you need many more sweeps to equilibrate.
+- Too low (< 0.1): moves are large but almost always rejected, wasting CPU time and also reducing effective diffusion.
+
+0.3 is a widely used default in the literature and represents a good balance for dense hard-polyhedra systems.
+
+### The BoxMC Tuning Problem
+
+Box moves are harder to tune because the optimal amplitude depends both on density (how compressible the system is at a given pressure) and on system size. A too-large length delta will almost always be rejected at high density; a too-small delta produces negligible volume fluctuations and poor pressure sampling.
+
+The `BoxMCMoveSize` tuner handles this automatically. Watching the `box_acc` column in the equilibration output tells you how well tuning is progressing. The `target_gap` column (|measured_rate − target_rate|) should decrease as equilibration proceeds.
+
+### Move Amplitude Interplay
+
+Note that `max_move_length = 0.01` and `max_move_shear = 0.01` are both 10× the initial deltas of 0.001. This gives the tuner ample room to increase the step size if the initial values are too conservative (which they often are at lower densities).
+
+---
+
+## 20. Worked Example — The Elongated Square Gyrobicupola Run
+
+The provided `simulparam_hard_polyhedra_npt_v6.json` sets up the following run:
+
+**System**: 4096 Elongated Square Gyrobicupola particles (Johnson solid J37), unit volume, in the principal axis frame.
+
+**Context**: This is a compression step from P=50 to P=70. The input configuration is the final state of a P=50 run, which is already near the equilibrium density for P=50.
+
+**Timeline**:
+```
+Timestep 0          → Start from P50_final.gsd
+Timestep 0–5,000,000 → Equilibration
+    Every 5,000 steps: check box_tuner.tuned?
+    MoveSize tuners fire every 1,000 steps
+    BoxMCMoveSize tuner fires every 1,000 steps
+    BoxMC fires every 25 steps (200 box attempts per 5,000-step chunk)
+    → box density increases as system compresses toward φ(P=70)
+    → Early exit when box_tuner.tuned = True
+
+Timestep 5,000,000–50,000,000 → Production (45,000,000 steps)
+    BoxMCMoveSize tuner removed
+    SDF compute attached
+    Trajectory written every 50,000 steps → 900 frames
+    Log written every 5,000 steps → 9,000 log rows
+    Restart checkpoint every 5,000 steps (always overwritten, 1 frame)
 ```
 
-### Reading the Scalar GSD Log
+**Output at 50,000,000 steps**:
+- `*_final.gsd`: final configuration at P=70 equilibrium density
+- `*_output_traj.gsd`: 900 frames spanning the production run
+- `npt_hpmc_log.log`: 9,000 rows of φ, acceptance rates, box geometry, SDF pressure
+- `box_npt_log.log`: 9,000 rows of Lx, Ly, Lz, xy, xz, yz
+- `*_scalar_log.gsd`: compact 9,000-frame scalar GSD
+- `*_summary.json`: provenance record
+
+---
+
+## 21. Frequently Asked Questions
+
+**Q: The simulation exits with `[FATAL] Initial convex-polyhedron configuration is NOT overlap-free`. What went wrong?**
+
+The input GSD (or restart GSD) contains particles that physically overlap. This can happen if: (a) the input GSD was generated with a different shape definition or scale factor; (b) the GSD was generated by a tool that does not enforce hard-particle constraints; (c) a previous run was interrupted mid-move (rare). Solution: verify that `shape_json_filename` and `shape_scale` match what was used to generate the input GSD. If using a restart GSD, delete it and restart from `input_gsd_filename`.
+
+**Q: The BoxMCMoveSize tuner never converges. Is this a problem?**
+
+Not necessarily. The script handles non-convergence gracefully: it restores the best-observed box move sizes and proceeds. Check the `target_gap` column in equilibration output — if it stays large throughout (e.g., > 0.1), you may need more `equil_steps` or a smaller `boxmc_length_delta` / `boxmc_shear_delta` to give the tuner a better starting point. Also verify that `target_box_movement_acc_rate = 0.3` is achievable at your pressure — at very high pressure, box moves may inherently have low acceptance rates regardless of step size.
+
+**Q: How do I extract the SDF pressure time series?**
 
 ```python
 import gsd.hoomd
-import numpy as np
-
-with gsd.hoomd.open("HOOMD_hard_cube_2197_hpmc_npt_P50_scalar_log.gsd") as f:
-    # Each frame corresponds to one log event
-    phi_series    = np.array([f[i].log["Box/phi"][0]       for i in range(len(f))])
-    betaP_series  = np.array([f[i].log["SDF/betaP"][0]     for i in range(len(f))])
-    timesteps     = np.array([f[i].configuration.step      for i in range(len(f))])
+with gsd.hoomd.open("..._scalar_log.gsd") as traj:
+    betaP_series = [frame.log["SDFPressure/betaP"][0] for frame in traj
+                    if "SDFPressure/betaP" in frame.log]
 ```
+Note: SDF logging starts only after equilibration, so the first frames of the scalar GSD will not have this quantity.
 
-### Reading the Trajectory GSD
+**Q: Can I run multiple independent replicas?**
 
-```python
-import gsd.hoomd
-import numpy as np
+Yes. Create a separate working directory for each replica, copy the input GSD and parameter JSON into each, and run. The seed file is generated independently in each directory, giving independent trajectories. Do not share a `random_seed.json` between replicas.
 
-with gsd.hoomd.open("npt_hpmc_output_traj.gsd") as traj:
-    n_frames = len(traj)
-    print(f"Trajectory: {n_frames} frames")
-    
-    # Read the last frame
-    frame = traj[-1]
-    positions    = frame.particles.position    # shape (N, 3)
-    orientations = frame.particles.orientation # shape (N, 4), quaternion (w,x,y,z)
-    box          = frame.configuration.box     # [Lx, Ly, Lz, xy, xz, yz, ...]
-```
+**Q: What does `nselect=1` mean in the integrator?**
 
-The trajectory GSD also embeds `type_shapes` in each frame, making it
-self-describing for OVITO and other visualisation tools that support the GSD
-format.
+It means one particle is selected per step per sweep. Since one sweep = N steps, on average every particle is attempted once per sweep. This is standard for single-particle HPMC. Setting `nselect=2` would double the number of attempts per sweep (roughly halving the sweep count needed for the same sampling, at 2× cost per sweep).
 
-### EOS Cross-Check via SDF
+**Q: The trajectory GSD keeps growing across restarts. Is this intentional?**
 
-During production, the time-averaged `<SDF/betaP>` should converge to the target
-`pressure` value. Significant deviation indicates inadequate equilibration or
-insufficient production length.
+Yes — the trajectory writer uses append mode (`"ab"`) specifically so that restarted runs extend the same trajectory file. This produces a continuous record of the simulation even across job scheduler interruptions. The restart GSD (single-frame, truncated) is separate and stays small.
 
-```python
-# Load scalar log
-with gsd.hoomd.open("HOOMD_hard_cube_2197_hpmc_npt_P50_scalar_log.gsd") as f:
-    betaP = np.array([f[i].log["SDF/betaP"][0] for i in range(len(f))])
-    step  = np.array([f[i].configuration.step  for i in range(len(f))])
+**Q: How do I change the shape to a different polyhedron?**
 
-# Identify production start (non-zero betaP = SDF attached = post-equil)
-prod_mask = betaP > 0
-
-print(f"Mean βP (production) = {betaP[prod_mask].mean():.2f}")
-print(f"Target βP            = 50.00")
-print(f"Relative error       = {abs(betaP[prod_mask].mean() - 50) / 50 * 100:.2f}%")
-```
+1. Prepare a shape JSON file with the new polyhedron's vertices (in the principal axis frame, centred at the origin) and its volume.
+2. Update `shape_json_filename` in the parameter JSON.
+3. Generate a valid, overlap-free initial configuration for the new shape (using, for example, HOOMD's initialisation tools or a separate packing algorithm).
+4. Update `input_gsd_filename` to point to this new configuration.
 
 ---
 
-## Hard-Cube Example Run
+## 22. Glossary
 
-The supplied parameter file runs the following experiment:
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| System | N = 2197 hard cubes | 13³ particles |
-| Target pressure | βP = 50 | Dense fluid or plastic crystal regime |
-| Starting configuration | φ ≈ 0.58 (NVT equilibrated) | Expected to compress slightly |
-| Initial move sizes | d = a = 0.045 σ | Conservative start; tuner adapts |
-| Equilibration | 5 × 10⁶ sweeps | ~10% of total run |
-| Production | 45 × 10⁶ sweeps | |
-| Log frequency | 5 000 sweeps | ~9 000 log rows during production |
-| Trajectory frequency | 50 000 sweeps | ~900 trajectory frames |
-| SDF | xmax = 0.02, dx = 1×10⁻⁴ | ~200 histogram bins |
-
-**Expected equilibrium packing fraction:** For hard cubes at βP ≈ 50, the
-equilibrium packing fraction is approximately φ_eq ≈ 0.50–0.55. The box should
-expand from the starting φ = 0.58 during equilibration.
-
-**Expected SDF output:** After equilibration, `<SDF/betaP>` should fluctuate
-around 50 with standard deviation ∝ 1/√(N × production_steps).
-
----
-
-## Tuning Guide
-
-### Choosing `equil_steps`
-
-The equilibration should be long enough for the `BoxMCMoveSize` tuner to
-converge (declare `tuned=True`). Convergence typically requires several hundred
-tuning events. With `box_tuner_freq = 2000` and the tuner needing ~200–500
-events to converge:
-
-```
-Minimum equil_steps ≈ 500 × box_tuner_freq = 500 × 2000 = 1,000,000
-```
-
-Add a safety margin (2–5×) to allow for slow convergence at unusual densities.
-The supplied value of 5,000,000 is conservative for this system.
-
-### Choosing Initial Move Sizes
-
-Start with `move_size_translation ≈ 0.03–0.10 × σ` (particle length unit) and
-`move_size_rotation ≈ 0.03–0.10` radians. The `MoveSize` tuner will adapt both
-within a few hundred sweep windows. Values that are too large (> 0.5) can cause
-many simultaneous overlaps and slow convergence.
-
-### Choosing `betaP`
-
-The relationship between `βP` and `φ` depends on the equation of state of your
-specific polyhedron. For hard spheres the Carnahan-Starling EOS provides a good
-guide. For hard cubes, the EOS is known from simulation data. In the absence of
-prior data, run a short test with `total_num_timesteps = 500000` at several
-`betaP` values and measure the equilibrium `φ` from the `Box/phi` column.
-
-### Choosing `sdf_xmax` and `sdf_dx`
-
-| φ | Recommended `sdf_xmax` | Recommended `sdf_dx` |
-|---|-----------------------|--------------------|
-| < 0.50 | 0.02 | 1e-4 |
-| 0.50–0.58 | 0.02 | 1e-4 |
-| 0.58–0.62 | 0.01 | 1e-4 |
-| > 0.62 | 0.005 | 1e-5 |
-
-At very high packing fractions (near close-packing) particles are nearly in
-contact and the SDF histogram peak is compressed toward x = 0, requiring a
-smaller `xmax` for accurate extrapolation.
+| Term | Definition |
+|---|---|
+| **betaP / βP** | Dimensionless reduced pressure: `βP = P/(k_BT)`. In reduced units where k_BT = 1, this equals the pressure P directly. The `pressure` parameter in the JSON. |
+| **Box move** | A trial change to the simulation box geometry proposed by BoxMC (either a length move or shear move). |
+| **BoxMC** | `hoomd.hpmc.update.BoxMC`. The HOOMD updater that implements NPT box sampling. |
+| **BoxMCMoveSize tuner** | `hoomd.hpmc.tune.BoxMCMoveSize`. Adjusts box move deltas to hit the target box acceptance rate. Always removed before production. |
+| **d** | Translational move size: the maximum displacement magnitude (in σ) for a single particle translation trial. |
+| **a** | Rotational move size: the maximum rotation angle (roughly in radians) for a particle rotation trial. |
+| **equil_steps** | Number of MC sweeps in the equilibration phase. |
+| **equil_steps_check_freq** | Sub-chunk size for the equilibration loop. The box_tuner convergence check fires once per chunk. |
+| **ETR** | Estimated Time Remaining. Computed as (steps_left / current_tps) and formatted as HH:MM:SS. |
+| **final GSD** | Single-frame GSD written at the end of production. Used as input for the next pipeline stage. |
+| **GSD** | General Simulation Data format. Binary file format used by HOOMD for trajectories, restarts, and logs. |
+| **HPMC** | Hard-Particle Monte Carlo. The HOOMD engine used here. |
+| **length move** | A BoxMC move that independently changes Lx, Ly, or Lz. |
+| **MC sweep** | One HOOMD timestep in HPMC: N trial moves for N particles. |
+| **MoveSize tuner** | `hoomd.hpmc.tune.MoveSize`. Adjusts particle d and a to hit target particle acceptance rate. Remains active during production. |
+| **npt_freq** | BoxMC trigger period. BoxMC fires every npt_freq MC sweeps. |
+| **NPT** | Isothermal-isobaric ensemble: constant number of particles (N), pressure (P), and temperature (T). Volume fluctuates. |
+| **overlap** | Two particles whose hard-body shapes physically intersect. Any overlap makes the configuration invalid and must not occur. |
+| **packing fraction (φ)** | `φ = N·v_p/V`. Fraction of box volume occupied by particles. |
+| **production** | The phase of the simulation after equilibration, with fixed box move sizes, where trajectory data is collected. |
+| **restart GSD** | Single-frame checkpoint GSD, overwritten every `restart_gsd_frequency` steps. Enables job recovery. |
+| **scalar GSD log** | GSD written with `filter=Null()` — no particle positions, only logged scalars. Compact and fast to read. |
+| **SDF** | Scale Distribution Function. A pressure estimator for hard-particle systems. Attached after equilibration. |
+| **shape JSON** | JSON file containing polyhedron vertex coordinates and reference volume. |
+| **shape_scale** | Scale factor applied to vertices. Particle volume = scale³ × reference volume. |
+| **shear move** | A BoxMC move that changes the tilt factors xy, xz, yz of the simulation box. |
+| **stage_id** | Pipeline stage counter. `-1` = single-stage; `0,1,2,...` = multi-stage pipeline. |
+| **tag** | Human-readable run label. Prefixes output filenames in multi-stage mode. |
+| **tps** | Timesteps (MC sweeps) per second. HOOMD's performance metric. |
+| **windowed rate** | Acceptance rate computed over the most recent logging window (current cumulative counts − previous cumulative counts), rather than over the entire run. |
 
 ---
 
-## Adding a New Polyhedron Shape
-
-1. **Create a shape JSON** with `_vertices` and `_volume` keys (or any key
-   ending in those suffixes). Vertex coordinates should be in the **body frame**,
-   centred at the origin. The volume should match the vertices exactly.
-
-2. **Choose `shape_scale`**: If your vertices span the range [−L/2, L/2] and
-   you want particle volume `V`, set `shape_scale = (V / reference_volume)^(1/3)`.
-   For unit-volume shapes (`reference_volume = 1.0`), `shape_scale = V^(1/3)`.
-
-3. **Update the JSON parameter file**:
-   ```json
-   "shape_json_filename": "shape_my_polyhedron.json",
-   "shape_scale": 1.0
-   ```
-
-4. **Generate an initial configuration** using any HOOMD NVT or Frenkel-Ladd
-   lattice tool, ensuring zero overlaps with the new shape definition.
-
-5. **Verify the shape** by running 0 steps and checking `mc.type_shapes`:
-   ```python
-   sim.run(0)
-   print(mc.type_shapes)
-   ```
-
-The script validates that vertices have shape (N_v, 3), that N_v ≥ 4 (minimum
-for a tetrahedron), and that `reference_volume > 0`.
-
----
-
-## Error Messages and Troubleshooting
-
-| Error message | Cause | Fix |
-|---------------|-------|-----|
-| `[FATAL] Input GSD not found: '<file>'` | Input GSD file missing | Generate the input configuration or fix the `input_gsd_filename` path |
-| `[FATAL] Initial convex-polyhedron configuration is NOT overlap-free` | Input GSD has overlapping particles | Re-generate the configuration; verify `shape_scale` matches the scale used to create the GSD |
-| `[FATAL] Missing required keys in '...': [...]` | JSON parameter file missing required keys | Add the listed keys to the JSON |
-| `[FATAL] Type errors in '...': * 'pressure': expected ..., got str` | JSON key has the wrong type (e.g. string instead of number) | Correct the value type in the JSON |
-| `[FATAL] Shape JSON file not found` | Shape JSON missing | Fix `shape_json_filename` path |
-| `[FATAL] Polyhedron vertices must have shape (N_vertices, 3)` | Malformed vertex array in shape JSON | Each row must be a 3-element list `[x, y, z]` |
-| `[ERROR] Stage N final GSD '...' already exists` | Multi-stage: stage already completed | Increment `stage_id_current` by 1 |
-| `[FATAL] Previous stage output not found` | Multi-stage: previous stage not complete | Run stage N-1 before stage N |
-| `[WARNING] BoxMCMoveSize tuner did NOT converge` | Equilibration too short | Increase `equil_steps` or decrease `box_tuner_freq` |
-| `[FATAL] GPU initialisation failed` (fallback to CPU) | GPU unavailable | Set `use_gpu: false` or fix CUDA installation |
-| `[ERROR] Emergency snapshot written → emergency_restart_<tag>.gsd` | Simulation crashed | Inspect the traceback; fix the cause; use the emergency snapshot as `input_gsd_filename` |
-
----
-
-## Known Limitations
-
-- **Single particle type only.** The integrator is configured for a single
-  particle type `"A"`. Multi-component systems require modifications to the
-  shape assignment block and move-size tuner registration.
-
-- **Convex polyhedra only.** `hoomd.hpmc.integrate.ConvexPolyhedron` cannot
-  simulate non-convex or concave shapes. Use
-  `hoomd.hpmc.integrate.ConvexPolyhedronUnion` for complex shapes built from
-  convex pieces.
-
-- **BoxMCMoveSize tuner convergence tolerance is hard-coded** to `tol=0.03` and
-  `gamma=0.8` in `build_simulation()`. To change these, edit the call to
-  `hoomd.hpmc.tune.BoxMCMoveSize.scale_solver` directly in the script.
-
-- **SDF is disabled on non-root MPI ranks.** `sdf.betaP` returns `None` on all
-  ranks except rank 0. The `SDFPressure` class guards against this but the SDF
-  value in the scalar log will be 0.0 on non-root ranks.
-
-- **No NPT shear flow.** The `reduce=0.0` setting in the shear move
-  configuration disables Lees-Edwards boundary conditions. For shear-flow
-  simulations, set `reduce` appropriately.
-
----
-
-## References
-
-1. Anderson, J. A., Irrgang, M. E., & Glotzer, S. C. (2016).
-   Scalable Metropolis Monte Carlo for simulation of hard shapes.
-   *Computer Physics Communications*, 204, 21–30.
-   https://doi.org/10.1016/j.cpc.2016.02.024
-
-2. Anderson, J. A., Jankowski, E., Grubb, T. L., Engel, M., & Glotzer, S. C.
-   (2013). Massively parallel Monte Carlo for many-particle simulations on GPUs.
-   *Journal of Computational Physics*, 254, 27–38.
-
-3. Eppenga, R., & Frenkel, D. (1984).
-   Monte Carlo study of the isotropic and nematic phases of infinitely thin hard platelets.
-   *Molecular Physics*, 52(6), 1303–1334.
-   https://doi.org/10.1080/00268978400101951
-   *(Original SDF pressure estimator)*
-
-4. HOOMD-blue v4.9 documentation.
-   https://hoomd-blue.readthedocs.io/en/v4.9.0/
-
-5. GSD file format specification.
-   https://gsd.readthedocs.io/
-
-6. Frenkel, D., & Smit, B. (2002).
-   *Understanding Molecular Simulation: From Algorithms to Applications* (2nd ed.).
-   Academic Press.
-   *(NPT Monte Carlo algorithm, Chapter 5)*
-
-7. Dijkstra, M., van Roij, R., & Evans, R. (1999).
-   Direct simulation of the phase behavior of binary hard-sphere mixtures.
-   *Physical Review Letters*, 82(1), 117.
-   *(Hard polyhedra phase behaviour reference)*
+*Last updated for `HOOMD_hard_polyhedra_NPT_v6.py` with parameter file `simulparam_hard_polyhedra_npt_v6.json` (P=70, N=4096 Elongated Square Gyrobicupola).*

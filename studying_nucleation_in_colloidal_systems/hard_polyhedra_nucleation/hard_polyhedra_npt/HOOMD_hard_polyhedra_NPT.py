@@ -7,10 +7,12 @@
 # -------
 # Run a constant-pressure (NPT) hard Convex-Polyhedron HPMC simulation using
 # HOOMD-blue v4.  The code executes two phases in sequence:
-#   1. EQUILIBRATION — adaptive tuners are active; box-move sizes are adjusted
-#      until the BoxMCMoveSize tuner converges, then removed.
-#   2. PRODUCTION   — all move sizes remain fixed; trajectory/log files are
-#      written continuously.
+#   1. EQUILIBRATION — adaptive tuners are active; box-move sizes are adjusted.
+#      If BoxMCMoveSize converges, its final move sizes are used.  If it does
+#      not converge, the best observed box move sizes — judged by closeness of
+#      the measured box acceptance rate to the requested target — are restored.
+#   2. PRODUCTION   — BoxMCMoveSize is always removed before production; box
+#      move sizes remain fixed while trajectory/log files are written.
 #
 # ALGORITHM
 # ---------
@@ -30,10 +32,13 @@
 #       i. Attach BoxMCMoveSize tuner for all box-move types.
 #       j. Optionally configure SDF pressure compute (attached post-equil).
 # 6.  EQUILIBRATION loop:
-#       Run in chunks of `equil_steps_check_freq`; stop early when
-#       box_tuner.tuned is True; remove box_tuner from operations.
-# 7.  Attach SDF pressure compute (if enabled) after equilibration.
-# 8.  PRODUCTION run — sim.run(prod_steps) with fixed move sizes.
+#       Run in chunks of `equil_steps_check_freq`; track the box move sizes
+#       whose measured box acceptance rate is closest to the target; stop early
+#       when box_tuner.tuned is True.
+# 7.  Always remove BoxMCMoveSize before production.  If tuning did not
+#       converge, restore the best observed box move sizes first.
+# 8.  Attach SDF pressure compute (if enabled) after equilibration.
+# 9.  PRODUCTION run — sim.run(prod_steps) with fixed box move sizes.
 # 9.  Write final GSD, summary JSON, and console banner.
 # 10. Always flush and close open log file handles in a `finally` block.
 #
@@ -585,421 +590,254 @@ class MoveSizeProp:
 
 
 class BoxMCStatus:
-    """
-    Helper class to report BoxMC move acceptance rates in a logger-friendly way.
-
-    Why this class is needed
-    ------------------------
-    HOOMD's BoxMC object stores cumulative move counters such as:
-
-        boxmc.volume_moves => (accepted, rejected)
-        boxmc.aspect_moves => (accepted, rejected)
-        boxmc.shear_moves  => (accepted, rejected)
-
-    These are cumulative from the beginning of the run, not acceptance rates
-    over the most recent logging window.
-
-    This class converts those cumulative counters into windowed acceptance
-    rates suitable for logging into `npt_hpmc_log.log`.
-
-    Important design requirement
-    ----------------------------
-    During one logging event, HOOMD may query multiple properties one after
-    another:
-
-        acceptance_rate
-        volume_acc_rate
-        aspect_acc_rate
-        shear_acc_rate
-
-    Therefore, we must NOT let one property "consume" the deltas before the
-    others are queried. To solve that, we:
-      1. compute the rates once per timestep,
-      2. cache them,
-      3. return the cached values for all properties queried at that timestep.
-
-    Meaning of the rates
-    --------------------
-    - volume_acc_rate : acceptance of HOOMD's volume_moves counter
-                        (this includes volume/length-related box moves as
-                        reported by HOOMD's BoxMC API)
-    - aspect_acc_rate : aspect ratio move acceptance
-    - shear_acc_rate  : shear move acceptance
-    - acceptance_rate : combined acceptance over all three move classes
-
-    Export dictionary
-    -----------------
-    `_export_dict` allows these quantities to be exposed to the HOOMD logger.
-    The tuple format is:
-        ("scalar", True)
-
-    meaning:
-    - scalar quantity
-    - loggable
-    """
-
+    # ---------------------------------------------------------------------
+    # HOOMD logger export dictionary
+    # ---------------------------------------------------------------------
     _export_dict = {
-        "acceptance_rate": ("scalar", True),    # combined rate, all box moves
-        "volume_acc_rate": ("scalar", True),    # volume-move acceptance fraction
-        "aspect_acc_rate": ("scalar", True),    # aspect-move acceptance fraction
-        "shear_acc_rate": ("scalar", True),     # shear-move acceptance fraction
+        # Combined windowed acceptance rate for all tracked BoxMC moves:
+        "acceptance_rate":      ("scalar", True),  # windowed combined box acceptance
+        # Windowed acceptance rate for length/volume-like box moves.
+        "length_acc_rate":      ("scalar", True),  # windowed length/volume-move acceptance
+        # Windowed acceptance rate for shear box moves.
+        "shear_acc_rate":       ("scalar", True),  # windowed shear-move acceptance
+        # Windowed raw length/volume-like move counts as a string:
+        "length_moves_str":     ("string", True),  # windowed "accepted,rejected,total"
+        # Windowed raw shear move counts as:
+        "shear_moves_str":      ("string", True),  # windowed "accepted,rejected,total"
+        # Windowed raw combined box move counts as:
+        "combined_moves_str":   ("string", True),  # windowed "accepted,rejected,total"
     }
 
     def __init__(self, boxmc, sim):
-        """
-        Parameters
-        ----------
-        boxmc : hoomd.hpmc.update.BoxMC
-            The HOOMD BoxMC updater whose move counters we want to monitor.
-
-        sim : hoomd.Simulation
-            The active HOOMD simulation object.
-        """
-
+        # Store the HOOMD BoxMC updater.
         self.boxmc = boxmc
+        # Store the HOOMD Simulation object.
         self.sim = sim
-
-        # Previous cumulative counters.
-        #
-        # Structure after initialization:
-        # {
-        #   "volume": (accepted_prev, rejected_prev),
-        #   "aspect": (accepted_prev, rejected_prev),
-        #   "shear":  (accepted_prev, rejected_prev),
-        # }
-        #
-        # This starts as None because before the first read we have no "previous"
-        # reference point.
-        self._prev_counts = None
-
-        # Cache bookkeeping:
-        #
-        # We compute fresh rates only once per timestep and store them here.
-        # If multiple properties are queried during the same timestep, they all
-        # use the same cached values.
+        # Previous cumulative shear counter.
+        # This will eventually store: (previous_shear_accepted, previous_shear_rejected)
+        self._prev_shear = None
+        # Previous cumulative length/volume-like counter.
+        # This will eventually store: (previous_length_accepted, previous_length_rejected)
+        # In this code, length/volume-like counters come from boxmc.volume_moves
+        self._prev_length_like = None
+        # Timestep at which the cache was last updated.
         self._cached_timestep = None
-        self._cached_rates = {
-            "overall": 0.0,
-            "volume": 0.0,
-            "aspect": 0.0,
-            "shear": 0.0,
-        }
-
-    def _safe_zero_cache(self, timestep=None):
-        """
-        Reset cached rates to zero in a controlled way.
-
-        This helper is useful when:
-        - the simulation timestep cannot be read,
-        - BoxMC counters are temporarily unavailable,
-        - HOOMD raises a data-access related exception.
-
-        Parameters
-        ----------
-        timestep : int or None
-            The timestep associated with this cache state.
-        """
-        self._cached_timestep = timestep
-        self._cached_rates = {
-            "overall": 0.0,
-            "volume": 0.0,
-            "aspect": 0.0,
-            "shear": 0.0,
-        }
-
-    def _read_counts(self):
-        """
-        Read the cumulative accepted/rejected counts from BoxMC.
-
-        Returns
-        -------
-        dict
-            Dictionary of the form:
-            {
-                "volume": (accepted, rejected),
-                "aspect": (accepted, rejected),
-                "shear":  (accepted, rejected),
-            }
-
-        Notes
-        -----
-        HOOMD BoxMC counters are cumulative.
-        They are NOT already acceptance fractions.
-
-        Exception handling
-        ------------------
-        We keep this method narrow and let the caller decide how to handle
-        failures. That keeps the logic cleaner.
-        """
-
-        # Read raw counters from HOOMD.
-        # Each returned tuple is interpreted as:
-        #     (accepted, rejected)
-        #
-        # Not:
-        #     (accepted, total)
-        a_v, r_v = self.boxmc.volume_moves
-        a_a, r_a = self.boxmc.aspect_moves
-        a_s, r_s = self.boxmc.shear_moves
-
-        # Convert to plain Python ints for safety and consistency.
-        return {
-            "volume": (int(a_v), int(r_v)),
-            "aspect": (int(a_a), int(r_a)),
-            "shear":  (int(a_s), int(r_s)),
-        }
+        # Cached combined acceptance rate for the latest window.
+        self._cached_overall = 0.0
+        # Cached length/volume-like acceptance rate for the latest window.
+        self._cached_length = 0.0
+        # Cached shear acceptance rate for the latest window.
+        self._cached_shear = 0.0
+        # Cached raw length/volume-like counts for the latest window: (accepted, rejected, total)
+        self._cached_length_counts = (0, 0, 0)
+        # Cached raw shear counts for the latest window: (accepted, rejected, total)
+        self._cached_shear_counts = (0, 0, 0)
+        # Cached raw combined counts for the latest window: (accepted, rejected, total)
+        self._cached_combined_counts = (0, 0, 0)
 
     @staticmethod
-    def _compute_rate(delta_accepted, delta_rejected):
+    def _compute_rate(acc, rej):
+        total = acc + rej
+        return acc / total if total > 0 else 0.0
+
+    @staticmethod
+    def _delta_counts(now, prev):
         """
-        Compute acceptance rate from accepted/rejected deltas.
+        Return window counts from cumulative HOOMD counters.
 
-        Parameters
-        ----------
-        delta_accepted : int
-            Number of accepted moves in the logging window.
-
-        delta_rejected : int
-            Number of rejected moves in the logging window.
-
-        Returns
-        -------
-        float
-            Acceptance fraction:
-                accepted / (accepted + rejected)
-
-            If there were no attempted moves in the window, returns 0.0.
+        HOOMD v4 BoxMC counters can reset at the beginning of a new sim.run()
+        call.  If a reset is detected, use the current counter values directly
+        instead of subtracting the previous cached values.
         """
-        total_attempts = delta_accepted + delta_rejected
-        if total_attempts <= 0:
-            return 0.0
-        return delta_accepted / total_attempts
+        if prev is None or now[0] < prev[0] or now[1] < prev[1]:
+            return now
+        return (max(0, now[0] - prev[0]), max(0, now[1] - prev[1]))
 
     def _refresh_cache(self):
         """
-        Refresh cached acceptance rates — at most once per timestep.
+        Refresh the cached BoxMC acceptance diagnostics for the current timestep.
 
-        ALGORITHM
-        ---------
-        Step 1: Read ``sim.timestep`` safely; fall back to zero cache on error.
-        Step 2: If ``_cached_timestep`` == current timestep → return (cache hit).
-        Step 3: Read current cumulative BoxMC counters; fall back to zero cache
-                on error (DataAccessError before updater fires).
-        Step 4: Compute windowed deltas vs ``_prev_counts``.
-                  - First call: _prev_counts is None => use full cumulative window.
-                  - Subsequent calls: subtract previous counts from current.
-                  - Clamp any negative deltas to 0 (defensive guard against
-                    counter resets or unexpected HOOMD behaviour).
-        Step 5: Update ``_prev_counts`` to current counts.
-        Step 6: Convert per-move deltas to acceptance fractions.
-        Step 7: Compute combined overall fraction across all move types.
-        Step 8: Store all four rates in ``_cached_rates`` with the current
-                timestep stamp so that repeated property accesses at the same
-                timestep all return the same values.
+        This method does the main work of the class.
 
-        Exception strategy
-        ------------------
-        Any exception that occurs while reading the simulation state or BoxMC
-        counters is caught here and results in zero cached rates.  This keeps
-        the simulation running even if HOOMD temporarily refuses to serve the
-        counter values (can happen transiently at initialisation or across
-        certain MPI barriers).
+        Steps
+        -----
+        1. Check whether the cache is already valid for this timestep.
+        2. Read raw HOOMD BoxMC counters.
+        3. Convert them to integer tuples.
+        4. Compute window counts by subtracting previous counters.
+        5. Update previous counters.
+        6. Compute length, shear, and combined acceptance rates.
+        7. Store everything in cached variables.
+
+        Why cache?
+        ----------
+        HOOMD's logger may request multiple properties from this object at the
+        same timestep:
+
+            acceptance_rate
+            length_acc_rate
+            shear_acc_rate
+            length_moves_str
+            shear_moves_str
+            combined_moves_str
+
+        If every property independently subtracted counters and updated
+        previous baselines, the first property call would consume the window,
+        and the later properties would incorrectly see zero moves.
+
+        Therefore, all properties call _refresh_cache(), but this function only
+        recomputes once per timestep. Subsequent property calls at the same
+        timestep simply reuse the cached values.
         """
 
-        # ------------------------------------------------------------------
-        # Step 1: Read the current simulation timestep safely.
-        # ------------------------------------------------------------------
-        try:
-            current_timestep = int(self.sim.timestep)
-        except Exception:
-            # If timestep is unavailable for any reason, do not crash the run.
-            # Instead, set zero rates and return.
-            self._safe_zero_cache(timestep=None)
-            return
+        # Current HOOMD timestep.
+        current_timestep = int(self.sim.timestep)
 
-        # ------------------------------------------------------------------
-        # Step 2: If we already refreshed at this timestep, do nothing.
-        # ------------------------------------------------------------------
+        # If we already refreshed at this timestep, return immediately.
+        #
+        # This is essential because the HOOMD logger can query several
+        # properties at the same timestep. Without this guard, the first
+        # property call would update _prev_length_like/_prev_shear, and the
+        # next property call would see zero window counts.
         if self._cached_timestep == current_timestep:
             return
 
-        # ------------------------------------------------------------------
-        # Step 3: Read current cumulative BoxMC counters safely.
-        # ------------------------------------------------------------------
+        # -----------------------------------------------------------------
+        # Read raw BoxMC counters from HOOMD.
+        # -----------------------------------------------------------------
         try:
-            current_counts = self._read_counts()
-        except Exception:
-            # This can happen if HOOMD temporarily does not allow reading the
-            # counters, or if the updater is not fully attached yet, or due to
-            # some other runtime access issue.
-            #
-            # We again fail gracefully and write zeros for this logging event.
-            self._safe_zero_cache(timestep=current_timestep)
-            return
+            length_acc, length_rej = self.boxmc.volume_moves
+            shear_acc, shear_rej = self.boxmc.shear_moves
+        except DataAccessError:
+            length_acc = length_rej = shear_acc = shear_rej = 0
 
-        # ------------------------------------------------------------------
-        # Step 4: Compute windowed deltas.
-        # ------------------------------------------------------------------
-        #
-        # If this is the first-ever observation, we do not yet have previous
-        # counts. In that case, use the currently available cumulative counts
-        # as the initial "window".
-        #
-        # That means the first logged rate corresponds to all attempts seen
-        # since counters started being tracked.
-        if self._prev_counts is None:
-            delta_counts = current_counts
-        else:
-            delta_counts = {}
+        # In this code, BoxMC.length moves are enabled. In HOOMD v4 these
+        # length/volume-like accepted,rejected counts are exposed through
+        # boxmc.volume_moves. Shear accepted,rejected counts are exposed
+        # separately through boxmc.shear_moves.
+        length_now = (int(length_acc), int(length_rej))
+        shear_now = (int(shear_acc), int(shear_rej))
 
-            for move_name in ("volume", "aspect", "shear"):
-                acc_now, rej_now = current_counts[move_name]
-                acc_prev, rej_prev = self._prev_counts[move_name]
+        # -----------------------------------------------------------------
+        # Convert cumulative counters into window counters.
+        # -----------------------------------------------------------------
+        dlen_acc, dlen_rej = self._delta_counts(length_now, self._prev_length_like)
+        dshr_acc, dshr_rej = self._delta_counts(shear_now, self._prev_shear)
 
-                # Compute the change since the previous logging window.
-                delta_acc = acc_now - acc_prev
-                delta_rej = rej_now - rej_prev
+        # Store current cumulative counters as the new baseline for the next
+        # logging window.
+        self._prev_length_like = length_now
+        self._prev_shear = shear_now
 
-                # Defensive programming:
-                # In normal operation, these deltas should not be negative.
-                # If they somehow are (for example, counter reset, restart edge
-                # case, or unexpected HOOMD behavior), clamp to zero rather than
-                # producing nonsense negative acceptance fractions.
-                if delta_acc < 0:
-                    delta_acc = 0
-                if delta_rej < 0:
-                    delta_rej = 0
+        # -----------------------------------------------------------------
+        # Compute total attempts for each move family.
+        # -----------------------------------------------------------------
+        len_total = dlen_acc + dlen_rej
+        shr_total = dshr_acc + dshr_rej
+        comb_acc = dlen_acc + dshr_acc
+        comb_rej = dlen_rej + dshr_rej
+        comb_total = comb_acc + comb_rej
 
-                delta_counts[move_name] = (delta_acc, delta_rej)
+        # -----------------------------------------------------------------
+        # Compute and cache acceptance rates.
+        # -----------------------------------------------------------------
+        self._cached_length = self._compute_rate(dlen_acc, dlen_rej)
+        self._cached_shear = self._compute_rate(dshr_acc, dshr_rej)
+        self._cached_overall = self._compute_rate(comb_acc, comb_rej)
 
-        # Update previous counts AFTER delta computation.
-        self._prev_counts = current_counts
-
-        # ------------------------------------------------------------------
-        # Step 5: Convert per-move deltas into per-move acceptance fractions.
-        # ------------------------------------------------------------------
-        vol_acc, vol_rej = delta_counts["volume"]
-        asp_acc, asp_rej = delta_counts["aspect"]
-        shr_acc, shr_rej = delta_counts["shear"]
-
-        volume_rate = self._compute_rate(vol_acc, vol_rej)
-        aspect_rate = self._compute_rate(asp_acc, asp_rej)
-        shear_rate = self._compute_rate(shr_acc, shr_rej)
-
-        # ------------------------------------------------------------------
-        # Step 6: Compute combined overall acceptance fraction.
-        # ------------------------------------------------------------------
-        total_acc = vol_acc + asp_acc + shr_acc
-        total_rej = vol_rej + asp_rej + shr_rej
-        overall_rate = self._compute_rate(total_acc, total_rej)
-
-        # ------------------------------------------------------------------
-        # Step 7: Store results in cache for this timestep.
-        # ------------------------------------------------------------------
+        # -----------------------------------------------------------------
+        # Cache raw counts in accepted,rejected,total form.
+        # -----------------------------------------------------------------
+        self._cached_length_counts = (dlen_acc, dlen_rej, len_total)
+        self._cached_shear_counts = (dshr_acc, dshr_rej, shr_total)
+        self._cached_combined_counts = (comb_acc, comb_rej, comb_total)
+        # Mark cache as valid for this timestep.
         self._cached_timestep = current_timestep
-        self._cached_rates = {
-            "overall": overall_rate,
-            "volume": volume_rate,
-            "aspect": aspect_rate,
-            "shear":  shear_rate,
-        }
+
+    @staticmethod
+    def _counts_to_str(counts):
+        return f"{counts[0]},{counts[1]},{counts[2]}"
 
     @property
     def acceptance_rate(self):
-        """
-        Combined acceptance fraction over volume + aspect + shear moves.
-        """
         self._refresh_cache()
-        return self._cached_rates["overall"]
+        return self._cached_overall
 
     @property
-    def volume_acc_rate(self):
-        """
-        Acceptance fraction for HOOMD's `volume_moves` counter.
-        """
+    def length_acc_rate(self):
         self._refresh_cache()
-        return self._cached_rates["volume"]
-
-    @property
-    def aspect_acc_rate(self):
-        """
-        Acceptance fraction for aspect-ratio box moves.
-        """
-        self._refresh_cache()
-        return self._cached_rates["aspect"]
+        return self._cached_length
 
     @property
     def shear_acc_rate(self):
-        """
-        Acceptance fraction for shear box moves.
-        """
         self._refresh_cache()
-        return self._cached_rates["shear"]
+        return self._cached_shear
+
+    @property
+    def length_moves_str(self):
+        self._refresh_cache()
+        return self._counts_to_str(self._cached_length_counts)
+
+    @property
+    def shear_moves_str(self):
+        self._refresh_cache()
+        return self._counts_to_str(self._cached_shear_counts)
+
+    @property
+    def combined_moves_str(self):
+        self._refresh_cache()
+        return self._counts_to_str(self._cached_combined_counts)
 
 
 class BoxSeqProp:
     """
-    Exposes cumulative BoxMC move counters as formatted 'accepted,rejected'
-    strings suitable for the box Table log.
+    Exposes raw BoxMC move counters as formatted strings for the box Table log.
 
-    Unlike BoxMCStatus, this class logs the raw cumulative counts rather than
-    windowed acceptance fractions — providing a complete audit trail of how
-    many box moves were attempted and accepted over the entire run.
-
-    Parameters
-    ----------
-    boxmc : hoomd.hpmc.update.BoxMC
-        The active BoxMC updater.
+    These are the raw HOOMD counters visible at the logging event.  In the
+    equilibration loop, each sim.run(equil_steps_check_freq) chunk resets the
+    BoxMC counters in HOOMD v4, so these are effectively per-chunk counters
+    when printed immediately after a chunk.
     """
 
     _export_dict = {
-        "volume_moves_str": ("string", True),  # "accepted,rejected" for volume
-        "aspect_moves_str": ("string", True),  # "accepted,rejected" for aspect
-        "shear_moves_str":  ("string", True),  # "accepted,rejected" for shear
+        "length_moves_str":    ("string", True),  # "accepted,rejected,total" for volume/length-like moves
+        "shear_moves_str":     ("string", True),  # "accepted,rejected,total" for shear moves
+        "combined_moves_str":  ("string", True),  # "accepted,rejected,total" for length+shear
     }
 
     def __init__(self, boxmc: hoomd.hpmc.update.BoxMC) -> None:
         self.boxmc = boxmc
 
-    @property
-    def volume_moves_str(self) -> str:
-        """
-        Cumulative volume-move counts as "accepted,rejected".
-
-        Returns "0,0" before the BoxMC updater has fired its first event
-        (DataAccessError at HOOMD initialisation time).
-        """        
+    @staticmethod
+    def _counter_to_tuple(counter):
         try:
-            a, r = self.boxmc.volume_moves
-            return f"{a},{r}"
+            a, r = counter
+            a = int(a)
+            r = int(r)
+            return a, r, a + r
         except DataAccessError:
-            return "0,0"
+            return 0, 0, 0
+
+    @staticmethod
+    def _tuple_to_str(vals) -> str:
+        return f"{vals[0]},{vals[1]},{vals[2]}"
 
     @property
-    def aspect_moves_str(self) -> str:
-        """
-        Cumulative aspect-move counts as "accepted,rejected".
-
-        Returns "0,0" before the BoxMC updater has fired its first event.
-        """        
-        try:
-            a, r = self.boxmc.aspect_moves
-            return f"{a},{r}"
-        except DataAccessError:
-            return "0,0"
+    def length_moves_str(self) -> str:
+        """Raw volume/length-like BoxMC counts as "accepted,rejected,total"."""
+        return self._tuple_to_str(self._counter_to_tuple(self.boxmc.volume_moves))
 
     @property
     def shear_moves_str(self) -> str:
-        """
-        Cumulative shear-move counts as "accepted,rejected".
+        """Raw shear BoxMC counts as "accepted,rejected,total"."""
+        return self._tuple_to_str(self._counter_to_tuple(self.boxmc.shear_moves))
 
-        Returns "0,0" before the BoxMC updater has fired its first event.
-        """        
-        try:
-            a, r = self.boxmc.shear_moves
-            return f"{a},{r}"
-        except DataAccessError:
-            return "0,0"
+    @property
+    def combined_moves_str(self) -> str:
+        """Raw combined length+shear BoxMC counts as "accepted,rejected,total"."""
+        la, lr, _ = self._counter_to_tuple(self.boxmc.volume_moves)
+        sa, sr, _ = self._counter_to_tuple(self.boxmc.shear_moves)
+        return self._tuple_to_str((la + sa, lr + sr, la + lr + sa + sr))
 
 
 class OverlapCount:
@@ -1043,10 +881,10 @@ class SDFPressure:
     to the SDF s(x) (the distribution of the smallest scale factor by which
     you would need to grow a particle before it overlaps a neighbour) via:
 
-        \beta P = rho * (1 + s(0⁺) / (2d))
+        \beta P = rho * (1 + s(0+) / (2d))
 
     where d = 3 (dimensionality) and rho = N/V is the number density.
-    The loggable quantity ``sdf.betaP`` gives βP directly in units of 1/V.
+    The loggable quantity ``sdf.betaP`` gives \beta P directly in units of 1/V.
 
     WHY SDF IS ATTACHED AFTER EQUILIBRATION
     ----------------------------------------
@@ -1304,12 +1142,12 @@ class SimulationParams:
     max_translation_move:   float  = 0.2        # cap on translational move size d
     max_rotation_move:      float  = 0.5        # cap on rotational move size a
 
-    # --- SDF pressure compute  [N-11] ---
+    # --- SDF pressure compute  ---
     enable_sdf:             bool   = True  # attach hoomd.hpmc.compute.SDF
     sdf_xmax:               float  = 0.02  # max scale factor for SDF histogram
     sdf_dx:                 float  = 1e-4  # histogram bin width
 
-    # --- Hardware  [N-16] ---
+    # --- Hardware  ---
     use_gpu:                bool   = False
     gpu_id:                 int    = 0
 
@@ -1450,14 +1288,9 @@ _OPTIONAL_KEYS: dict[str, type] = {
     "enable_sdf":               bool,
     "sdf_xmax":                 (int, float),
     "sdf_dx":                   (int, float),
-    "boxmc_volume_delta":       (int, float),
-    "boxmc_volume_mode":        str,
     "boxmc_length_delta":       (int, float),
-    "boxmc_aspect_delta":       (int, float),
     "boxmc_shear_delta":        (int, float),
-    "max_move_volume":          (int, float),
     "max_move_length":          (int, float),
-    "max_move_aspect":          (int, float),
     "max_move_shear":           (int, float),
     "max_translation_move":     (int, float),
     "max_rotation_move":        (int, float),
@@ -2486,8 +2319,8 @@ def build_simulation(
     # ------------------------------------------------------------------
     # BoxMC implements the NPT ensemble by proposing random trial changes
     # to the simulation box and accepting/rejecting them via the NPT
-    # Metropolis criterion, which includes the P·ΔV work term and the
-    # N·ln(V_new/V_old) Jacobian.
+    # Metropolis criterion, which includes the P*delat(V) work term and the
+    # N*ln(V_new/V_old) Jacobian.
     # betaP = P/(kBT) is the dimensionless reduced pressure.
     try:
         betaP_variant = hoomd.variant.Constant(params.pressure)
@@ -2496,28 +2329,12 @@ def build_simulation(
             betaP=betaP_variant,
         )
 
-        # Volume moves: propose isotropic scaling V => V*(1 +- delta_V).
-        # mode="standard": linear volume change. 
-        boxmc.volume = dict(
-            weight=1.0,
-            mode=params.boxmc_volume_mode,     # "standard" = linear ΔV
-            delta=params.boxmc_volume_delta,   # max |ΔV| per move attempt
-        )
-
         # Length moves: propose independent changes to Lx, Ly, Lz at
         # constant shape (tilt factors unchanged).
         boxmc.length = dict(
             delta=(params.boxmc_length_delta,  # max |delta Lx| per attempt
                 params.boxmc_length_delta,     # max |delta Ly| per attempt
                 params.boxmc_length_delta),    # max |delta Lz| per attempt
-            weight=1.0,
-        )
-
-        # Aspect moves: rescale one axis relative to the others at constant V.
-        # Useful for relaxing aspect ratio in cases where the equilibrium
-        # box is not cubic.
-        boxmc.aspect = dict(
-            delta=params.boxmc_aspect_delta,   # max rescaling factor per attempt
             weight=1.0,
         )
 
@@ -2539,10 +2356,7 @@ def build_simulation(
             "Failed while configuring BoxMC updater.",
             pressure=params.pressure,
             npt_freq=params.npt_freq,
-            volume_mode=params.boxmc_volume_mode,
-            volume_delta=params.boxmc_volume_delta,
             length_delta=params.boxmc_length_delta,
-            aspect_delta=params.boxmc_aspect_delta,
             shear_delta=params.boxmc_shear_delta,
             error_type=type(exc).__name__,
             error=str(exc),
@@ -2550,9 +2364,7 @@ def build_simulation(
 
     root_print(
         f"[INFO] BoxMC: betaP={params.pressure} | "
-        f"volume_delta={params.boxmc_volume_delta} | "
         f"length_delta={params.boxmc_length_delta} | "
-        f"aspect_delta={params.boxmc_aspect_delta} | "
         f"shear_delta={params.boxmc_shear_delta}"
     )
 
@@ -2563,19 +2375,23 @@ def build_simulation(
     # to the BoxMC updater so must be created after step 9.13.
     # ------------------------------------------------------------------
     box_mc_status = BoxMCStatus(boxmc, sim)
-    logger_sim[("BoxMCStatus", "acc_rate")]        = (box_mc_status, "acceptance_rate", "scalar")
-    logger_sim[("BoxMCStatus", "volume_acc_rate")] = (box_mc_status, "volume_acc_rate", "scalar")  
-    logger_sim[("BoxMCStatus", "aspect_acc_rate")] = (box_mc_status, "aspect_acc_rate", "scalar")  
-    logger_sim[("BoxMCStatus", "shear_acc_rate")]  = (box_mc_status, "shear_acc_rate",  "scalar") 
-    # Also log combined BoxMC acceptance in the compact scalar GSD 
-    scalar_gsd_logger[("BoxMCStatus", "acc_rate")] = (box_mc_status, "acceptance_rate", "scalar")
+    logger_sim[("BoxMCStatus", "acc_rate")]          = (box_mc_status, "acceptance_rate",    "scalar")
+    logger_sim[("BoxMCStatus", "length_acc_rate")]   = (box_mc_status, "length_acc_rate",    "scalar")
+    logger_sim[("BoxMCStatus", "shear_acc_rate")]    = (box_mc_status, "shear_acc_rate",     "scalar")
+    logger_sim[("BoxMCStatus", "length_moves")]      = (box_mc_status, "length_moves_str",   "string")
+    logger_sim[("BoxMCStatus", "shear_moves")]       = (box_mc_status, "shear_moves_str",    "string")
+    logger_sim[("BoxMCStatus", "combined_moves")]    = (box_mc_status, "combined_moves_str", "string")
+
+    # Also log BoxMC rates in the compact scalar GSD.  GSD scalar log keeps
+    # numeric rates only; raw string counters are written to the text logs.
+    scalar_gsd_logger[("BoxMCStatus", "acc_rate")]        = (box_mc_status, "acceptance_rate",  "scalar")
+    scalar_gsd_logger[("BoxMCStatus", "length_acc_rate")] = (box_mc_status, "length_acc_rate",  "scalar")
+    scalar_gsd_logger[("BoxMCStatus", "shear_acc_rate")]  = (box_mc_status, "shear_acc_rate",   "scalar")
 
     seq_prop = BoxSeqProp(boxmc)
-    logger_box[("BoxMC", "vol_moves")]    = (seq_prop, "volume_moves_str", "string")
-    logger_box[("BoxMC", "aspect_moves")] = (seq_prop, "aspect_moves_str", "string")
-    logger_box[("BoxMC", "shear_moves")]  = (seq_prop, "shear_moves_str",  "string")
-    # Also register the raw HOOMD counters directly on the box logger
-    logger_box.add(boxmc, quantities=["volume_moves", "aspect_moves", "shear_moves"])
+    logger_box[("BoxMC", "length_moves")]    = (seq_prop, "length_moves_str",   "string")
+    logger_box[("BoxMC", "shear_moves")]     = (seq_prop, "shear_moves_str",    "string")
+    logger_box[("BoxMC", "combined_moves")]  = (seq_prop, "combined_moves_str", "string")
 
     # ------------------------------------------------------------------
     # 9.15  MoveSize tuner for particle moves  
@@ -2631,7 +2447,7 @@ def build_simulation(
     # gamma=0.8: how aggressively the tuner scales delta.  Values closer
     #   to 1.0 are more aggressive; HOOMD documentation recommends 0.8.
     # tol=0.01: the tuner declares itself converged (box_tuner.tuned=True)
-    #   when the acceptance ratio is within ±0.01 (1%) of the target.
+    #   when the acceptance ratio is within +-0.01 (1%) of the target.
     #   The equilibration loop polls box_tuner.tuned and removes this tuner
     #   once converged, locking in the optimal box-move sizes for production.
     # max_move_size: upper bounds prevent the tuner from setting excessively
@@ -2640,17 +2456,13 @@ def build_simulation(
     box_tuner = hoomd.hpmc.tune.BoxMCMoveSize.scale_solver(
         trigger=hoomd.trigger.Periodic(params.box_tuner_freq),
         boxmc=boxmc,
-        moves=["volume",
-               "length_x", "length_y", "length_z",
-               "aspect",
+        moves=["length_x", "length_y", "length_z",
                "shear_x",  "shear_y",  "shear_z"],
         target=params.target_box_movement_acc_rate,
         max_move_size={
-            "volume":   params.max_move_volume,
             "length_x": params.max_move_length,
             "length_y": params.max_move_length,
             "length_z": params.max_move_length,
-            "aspect":   params.max_move_aspect,
             "shear_x":  params.max_move_shear,
             "shear_y":  params.max_move_shear,
             "shear_z":  params.max_move_shear,
@@ -2672,7 +2484,7 @@ def build_simulation(
     # x by which you would need to expand particles before a collision
     # occurs.  Extrapolating s(x) to x=0 gives the equation of state:
     #
-    #   \beta P = \rho · (1 + s(0+) / 6)     [hard spheres in 3D]
+    #   \beta P = \rho * (1 + s(0+) / 6)     [hard spheres in 3D]
     #
     # The loggable `betaP` property gives the instantaneous pressure in
     # units of 1/(length^3).  In NPT the box fluctuates, so the average
@@ -2748,6 +2560,205 @@ def _write_snapshot(sim: hoomd.Simulation, mc, filename: str) -> None:
         traj.append(frame)
 
 
+
+def _boxmc_counter_counts(moves) -> tuple[int, int, int]:
+    """Convert a HOOMD (accepted, rejected) counter to (accepted, rejected, total)."""
+    try:
+        # HOOMD counters are returned as accepted/rejected values.
+        accepted, rejected = moves
+        accepted = int(accepted)
+        rejected = int(rejected)
+        total = accepted + rejected
+        return accepted, rejected, total
+    except (TypeError, ValueError, DataAccessError):
+        return 0, 0, 0
+
+
+def _safe_acceptance_rate(moves) -> float:
+    """
+    Convert a HOOMD (accepted, rejected) move counter into an acceptance rate.
+
+    Returns 0.0 if no moves were attempted in the current run chunk.  In
+    HOOMD-blue v4, BoxMC counters are reset at the start of each sim.run()
+    call, so after each equilibration chunk these rates correspond to that
+    chunk only.
+    """
+    accepted, rejected, total = _boxmc_counter_counts(moves)
+    return accepted / total if total > 0 else 0.0
+
+
+def _tuple3_from_delta(delta) -> tuple[float, float, float]:
+    """Return a 3-tuple of floats from a scalar or sequence delta."""
+    if isinstance(delta, (int, float)):
+        val = float(delta)
+        return (val, val, val)
+    vals = tuple(float(x) for x in delta)
+    if len(vals) != 3:
+        raise ValueError(f"Expected a 3-component delta, got {delta!r}")
+    return vals
+
+
+def _capture_box_move_state(boxmc, sim, target_acceptance: float) -> dict:
+
+    """
+    Capture the current BoxMC move sizes and current acceptance diagnostics.
+
+    This function is called after each equilibration chunk.
+
+    Its purpose is to remember:
+
+        1. current length_delta
+        2. current shear_delta
+        3. current length/shear weights
+        4. current length acceptance rate
+        5. current shear acceptance rate
+        6. current combined box acceptance rate
+        7. raw accepted/rejected/attempted counts
+        8. distance from the target box acceptance rate
+
+    Parameters
+    ----------
+    boxmc
+        The active hoomd.hpmc.update.BoxMC object.
+
+    sim
+        The active hoomd.Simulation object. Used here only to record the
+        current timestep.
+
+    target_acceptance
+        Desired box move acceptance rate from the simulation parameter file,
+        e.g. params.target_box_movement_acc_rate.
+
+    Returns
+    -------
+    dict
+        A complete snapshot of current BoxMC move sizes and acceptance data.
+    """
+
+    # ---------------------------------------------------------------------
+    # 1. Read current BoxMC length and shear parameter dictionaries
+    # ---------------------------------------------------------------------
+    #
+    # boxmc.length is dict-like and contains fields such as:
+    #
+    #     {
+    #         "delta":  (dx, dy, dz),
+    #         "weight": weight_value,
+    #     }
+    #
+    # boxmc.shear is dict-like and contains fields such as:
+    #
+    #     {
+    #         "delta":  (dxy, dxz, dyz),
+    #         "weight": weight_value,
+    #         "reduce": reduce_value,
+    #     }
+    #
+    length_params = dict(boxmc.length)
+    shear_params = dict(boxmc.shear)
+
+    # ---------------------------------------------------------------------
+    # 2. Read raw BoxMC counters
+    # ---------------------------------------------------------------------
+    # HOOMD v4 exposes accepted/rejected volume and length moves together through boxmc.volume_moves. Since this code enables BoxMC.length moves
+    # and does not enable BoxMC.volume moves separately, boxmc.volume_moves is effectively the length-move counter in this run.
+    # shear attempts are exposed separately through boxmc.shear_moves.
+    
+    length_acc, length_rej, length_total = _boxmc_counter_counts(boxmc.volume_moves)
+    shear_acc, shear_rej, shear_total = _boxmc_counter_counts(boxmc.shear_moves)
+
+    # ---------------------------------------------------------------------
+    # 3. Combine length-like and shear counters
+    # ---------------------------------------------------------------------
+    #
+    # The combined box acceptance rate is computed from all accepted/rejected
+    # BoxMC moves included in these two counter families.
+    total_acc = length_acc + shear_acc
+    total_rej = length_rej + shear_rej
+    total = total_acc + total_rej
+
+    # ---------------------------------------------------------------------
+    # 4. Compute acceptance rates
+    # ---------------------------------------------------------------------
+    length_rate = length_acc / length_total if length_total > 0 else 0.0
+    shear_rate = shear_acc / shear_total if shear_total > 0 else 0.0
+    combined_rate = total_acc / total if total > 0 else 0.0
+
+
+    # ---------------------------------------------------------------------
+    # 5. Return a complete dictionary snapshot
+    # ---------------------------------------------------------------------
+    #
+    # This dictionary is stored as either:
+    #
+    #     current_box_move_state
+    #
+    # or, if it is the best so far:
+    #
+    #     best_box_move_state
+    #
+    # Later, if BoxMCMoveSize does not converge, best_box_move_state is passed
+    # to _restore_box_move_state(...).
+
+    return {
+        # Current HOOMD timestep when this state was captured.
+        "timestep": int(sim.timestep),
+        # Current length move size for length_x, length_y, length_z.
+        "length_delta": _tuple3_from_delta(length_params.get("delta", (0.0, 0.0, 0.0))),
+        # Current statistical weight for length moves.
+        "length_weight": float(length_params.get("weight", 0.0)),
+        # Current shear move size for shear_x, shear_y, shear_z.
+        "shear_delta": _tuple3_from_delta(shear_params.get("delta", (0.0, 0.0, 0.0))),
+        # Current statistical weight for shear moves.
+        "shear_weight": float(shear_params.get("weight", 0.0)),
+        "shear_reduce": float(shear_params.get("reduce", 0.0)),
+
+        # Acceptance rates from the same raw counters.
+        "length_acceptance_rate": float(length_rate),
+        "shear_acceptance_rate": float(shear_rate),
+        "combined_acceptance_rate": float(combined_rate),
+
+        # Raw accepted/rejected/total counts for debugging.
+        "length_accepts": int(length_acc),
+        "length_rejects": int(length_rej),
+        "length_attempts": int(length_total),
+        "shear_accepts": int(shear_acc),
+        "shear_rejects": int(shear_rej),
+        "shear_attempts": int(shear_total),
+        "combined_accepts": int(total_acc),
+        "combined_rejects": int(total_rej),
+        "combined_attempts": int(total),
+
+        "target_acceptance_rate": float(target_acceptance),
+        "score_abs_error": abs(float(combined_rate) - float(target_acceptance)),
+    }
+
+
+def _restore_box_move_state(boxmc, state: dict) -> None:
+    """Restore BoxMC length/shear move sizes from a captured state."""
+    boxmc.length = dict(
+        delta=tuple(state["length_delta"]),
+        weight=float(state["length_weight"]),
+    )
+    boxmc.shear = dict(
+        delta=tuple(state["shear_delta"]),
+        weight=float(state["shear_weight"]),
+        reduce=float(state["shear_reduce"]),
+    )
+
+
+def _tuner_is_attached(sim, tuner) -> bool:
+    """Identity-based test for whether a tuner is still attached."""
+    return any(obj is tuner for obj in sim.operations.tuners)
+
+
+def _remove_tuner_if_attached(sim, tuner) -> bool:
+    """Remove a tuner if attached; return True if removal occurred."""
+    if _tuner_is_attached(sim, tuner):
+        sim.operations.tuners.remove(tuner)
+        return True
+    return False
+
 def write_final_outputs(
     sim:        hoomd.Simulation,
     mc:         hoomd.hpmc.integrate.ConvexPolyhedron,
@@ -2757,6 +2768,7 @@ def write_final_outputs(
     start_time: float,
     seed:       int,
     json_path:  str,
+    box_tuning_result: Optional[dict] = None,
 ) -> None:
     """
     Write all final output files after the production run completes.
@@ -2787,6 +2799,8 @@ def write_final_outputs(
         Random seed used for this run (for provenance).
     json_path : str
         Path to the simulation parameter JSON file (for provenance).
+    box_tuning_result : dict or None
+        Provenance for the BoxMCMoveSize decision made before production.
     """
 
     N   = sim.state.N_particles
@@ -2823,6 +2837,7 @@ def write_final_outputs(
             "xz": sim.state.box.xz,
             "yz": sim.state.box.yz,
         },
+        "box_tuning_result": box_tuning_result,
         "runtime_seconds":   round(runtime, 2),
         "created":           time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -2852,6 +2867,8 @@ def write_final_outputs(
         f"  Particle volume       : {params.particle_volume}",
         f"  Final packing frac.   : {phi:.6f}",
         f"  Target betaP          : {params.pressure}",
+        f"  Box tuning mode       : {(box_tuning_result or {}).get('mode', 'unknown')}",
+        f"  Box tuner in production: {(box_tuning_result or {}).get('box_tuner_attached_during_production', 'unknown')}",
         f"  Overlaps at end       : {mc.overlaps}",
         f"  Final timestep        : {sim.timestep}",
         f"  Total timesteps       : {params.total_num_timesteps}",
@@ -3020,9 +3037,16 @@ def main() -> None:
         )
         root_flush_stdout()
 
-        # box_tuner_removed tracks whether the BoxMCMoveSize tuner converged
-        # and was removed early; used to issue a warning if it did not.
+        # Track the best observed BoxMC move-size state during equilibration.
+        # "Best" means the combined length+shear BoxMC acceptance rate in the
+        # current equilibration chunk is closest to target_box_movement_acc_rate.
+        # If BoxMCMoveSize never declares tuned, this state is restored before
+        # production and the tuner is removed anyway.
         box_tuner_removed = False
+        box_tuner_converged = False
+        best_box_move_state = None
+        selected_box_move_state = None
+
         for chunk_idx in range(n_chunks):
             # Run exactly equil_steps_check_freq HPMC sweeps.  Both tuners
             # (MoveSize and BoxMCMoveSize) fire on their own Periodic triggers
@@ -3030,44 +3054,195 @@ def main() -> None:
             sim.run(params.equil_steps_check_freq)
 
             # Recompute phi after this chunk; the box has likely changed due
-            # to accepted volume/length/aspect moves at the target pressure.
+            # to accepted length/shear moves at the target pressure.
             phi_now = N * params.particle_volume / sim.state.box.volume
+
+            # -------------------------------------------------------------------------
+            # Capture the current BoxMC move-size / acceptance state after this equilibration chunk.
+            # -------------------------------------------------------------------------
+            current_box_move_state = _capture_box_move_state(
+                boxmc=boxmc,
+                sim=sim,
+                target_acceptance=params.target_box_movement_acc_rate,
+            )
+
+            # The "best" state is defined as the state whose combined box acceptance rate
+            # is closest to the target box acceptance rate from the JSON file.
+            #
+            # Example:
+            #
+            #     target_box_movement_acc_rate = 0.30
+            #
+            #     chunk A: combined_acceptance_rate = 0.05
+            #              score_abs_error = |0.05 - 0.30| = 0.25
+            #
+            #     chunk B: combined_acceptance_rate = 0.228
+            #              score_abs_error = |0.228 - 0.30| = 0.072
+            #
+            #     chunk C: combined_acceptance_rate = 0.41
+            #              score_abs_error = |0.41 - 0.30| = 0.11
+            #
+            # Then chunk B is the best state.
+            #
+            # best_box_move_state is initially None before the first chunk.
+            # On the first chunk, we always store current_box_move_state.
+            # On later chunks, we replace it only if the new score is smaller.
+            if (
+                best_box_move_state is None
+                or current_box_move_state["score_abs_error"] < best_box_move_state["score_abs_error"]
+            ):
+                best_box_move_state = current_box_move_state
 
             root_print(
                 f"[EQUIL chunk {chunk_idx + 1}/{n_chunks}] "
                 f"step={sim.timestep} | phi={phi_now:.5f} | "
                 f"box_tuner.tuned={box_tuner.tuned} | "
+
+                # Combined acceptance from all tracked BoxMC moves.
+                # This is the value used to score closeness to the target.
+                f"box_acc={current_box_move_state['combined_acceptance_rate']:.5f} | "
+                # Length-only acceptance rate.
+                # In this code, HOOMD exposes length/volume-like counts through boxmc.volume_moves.
+                f"len_acc={current_box_move_state['length_acceptance_rate']:.5f} | "
+                # Shear-only acceptance rate.
+                f"shr_acc={current_box_move_state['shear_acceptance_rate']:.5f} | "
+                # Raw length/volume-like move counts: accepted,rejected,total
+                f"len_moves={current_box_move_state['length_accepts']},"
+                f"{current_box_move_state['length_rejects']},"
+                f"{current_box_move_state['length_attempts']} | "
+                # Raw shear move counts: accepted,rejected,total
+                f"shr_moves={current_box_move_state['shear_accepts']},"
+                f"{current_box_move_state['shear_rejects']},"
+                f"{current_box_move_state['shear_attempts']} | "
+                # Raw combined box move counts: accepted,rejected,total
+                f"box_moves={current_box_move_state['combined_accepts']},"
+                f"{current_box_move_state['combined_rejects']},"
+                f"{current_box_move_state['combined_attempts']} | "
+                # How far the current state is from target acceptance. Smaller is better.
+                f"target_gap={current_box_move_state['score_abs_error']:.5f} | "
+                # How far the best observed state so far is from target acceptance.
+                # This should stay the same or decrease as equilibration progresses.
+                f"best_gap={best_box_move_state['score_abs_error']:.5f} | "
+                # Current BoxMC length move amplitude tuple: (delta_x, delta_y, delta_z)
+                f"length_delta={current_box_move_state['length_delta']} | "
+                # Current BoxMC shear move amplitude tuple: (delta_xy, delta_xz, delta_yz)
+                f"shear_delta={current_box_move_state['shear_delta']} | "
+                # Current particle translational and rotational HPMC move sizes.
                 f"d={mc.d['A']:.5f} | a={mc.a['A']:.5f}"
             )
             root_flush_stdout()
 
+            # -------------------------------------------------------------------------
+            # Converged-tuner branch.
+            # -------------------------------------------------------------------------
             if box_tuner.tuned:
-                # All box-move deltas have converged to the target acceptance
-                # rate.  Remove the tuner from the operations list so delta
-                # values remain fixed during production — a requirement for a
-                # statistically well-defined NPT ensemble measurement.
-                sim.operations.tuners.remove(box_tuner)
+                # Converged: keep the current BoxMC move sizes, but still
+                # remove BoxMCMoveSize before production.  HOOMD states that
+                # this tuner continues tuning even after tuned=True, so leaving
+                # it attached during production is not acceptable.
+                selected_box_move_state = current_box_move_state
+                # Remove BoxMCMoveSize from sim.operations.tuners.
+                #
+                # This freezes the current box move sizes:
+                #
+                #     boxmc.length["delta"]
+                #     boxmc.shear["delta"]
+                #
+                # From this point onward, production will run with fixed BoxMC move sizes.
+                _remove_tuner_if_attached(sim, box_tuner)
+                # Record bookkeeping flags for later safety checks and summary JSON.
                 box_tuner_removed = True
+                box_tuner_converged = True
                 root_print(
-                    f"[INFO] BoxMCMoveSize tuner has converged at step "
-                    f"{sim.timestep}. Tuner removed."
+                    f"[INFO] BoxMCMoveSize tuner converged at step "
+                    f"{sim.timestep}. Current box move sizes locked and tuner removed."
                 )
+                # Exit the equilibration loop early because the tuner has converged.
+                # No need to spend the remaining equilibration chunks tuning.
                 break
 
-        # If all n_chunks ran without the tuner converging, the box-move
-        # deltas may not be fully optimal.  The simulation is still valid
-        # but the user should consider increasing equil_steps or loosening
-        # the BoxMCMoveSize tol parameter to allow earlier convergence.
-        if not box_tuner_removed:
+        # -------------------------------------------------------------------------
+        # Non-converged-tuner branch.
+        # -------------------------------------------------------------------------
+        #
+        # This block runs after the equilibration loop finishes.
+        #
+        # If the code reaches here with:
+        #
+        #     box_tuner_converged == False
+        if not box_tuner_converged:
+            if best_box_move_state is not None:
+                # Restore the best observed length_delta and shear_delta.
+                #
+                # This changes:
+                #     boxmc.length = {...}
+                #     boxmc.shear  = {...}
+                #
+                # to the move sizes stored in best_box_move_state.
+                #
+                # After this call, the BoxMC object is no longer necessarily using the
+                # final tuner values from the last equilibration chunk. It is using the
+                # best observed values according to score_abs_error.
+                _restore_box_move_state(boxmc, best_box_move_state)
+                # This is the state production will use.
+                selected_box_move_state = best_box_move_state
+                # Print a clear warning because this is not ideal convergence.
+                # But it is still safe because the tuner will be removed below.
+                root_print(
+                    f"[WARNING] BoxMCMoveSize tuner did NOT converge during "
+                    f"equilibration ({params.equil_steps} steps).\n"
+                    f"  => Restored best observed BoxMC move sizes from step "
+                    f"{best_box_move_state['timestep']}.\n"
+                    f"  => best_box_acc={best_box_move_state['combined_acceptance_rate']:.6f}, "
+                    f"target={params.target_box_movement_acc_rate:.6f}, "
+                    f"abs_error={best_box_move_state['score_abs_error']:.6f}.\n"
+                    f"  => length_delta={best_box_move_state['length_delta']}, "
+                    f"shear_delta={best_box_move_state['shear_delta']}."
+                )
+            else:
+                selected_box_move_state = _capture_box_move_state(
+                    boxmc=boxmc,
+                    sim=sim,
+                    target_acceptance=params.target_box_movement_acc_rate,
+                )
+                root_print(
+                    f"[WARNING] BoxMCMoveSize tuner did NOT converge and no "
+                    f"best-state record was available. Keeping current BoxMC "
+                    f"move sizes."
+                )
+
+            # -------------------------------------------------------------
+            # Remove the BoxMCMoveSize tuner even though it did not converge.
+            # -------------------------------------------------------------
+            _remove_tuner_if_attached(sim, box_tuner)
+            box_tuner_removed = True
             root_print(
-                f"[WARNING] BoxMCMoveSize tuner did NOT converge during "
-                f"equilibration ({params.equil_steps} steps).\n"
-                f"  => Running production with the tuner still active.\n"
-                f"  => Consider increasing 'equil_steps' or increasing "
-                f"'box_tuner_freq' to allow more tuning attempts."
+                "[INFO] BoxMCMoveSize tuner removed before production despite non-convergence."
             )
 
-        # Attach SDF after equilibration so that the box has converged  [N-11]
+        # Hard safety guard: production is forbidden if the BoxMCMoveSize tuner
+        # is still attached.  This encodes the user's priority directly in code.
+        if _tuner_is_attached(sim, box_tuner):
+            fail_with_context(
+                "Refusing to start production while BoxMCMoveSize tuner is still attached.",
+                timestep=sim.timestep,
+                box_tuner_converged=box_tuner_converged,
+                box_tuner_removed=box_tuner_removed,
+            )
+
+        # -------------------------------------------------------------------------
+        # Store box-tuning provenance for the final summary JSON.
+        # -------------------------------------------------------------------------
+        box_tuning_result = {
+            "mode": "converged_current_move_sizes" if box_tuner_converged else "nonconverged_best_observed_move_sizes",
+            "box_tuner_converged": bool(box_tuner_converged),
+            "box_tuner_removed_before_production": True,
+            "box_tuner_attached_during_production": False,
+            "selected_state": selected_box_move_state,
+            "best_state": best_box_move_state,
+        }
+
+        # Attach SDF after equilibration so that the box has converged 
         # The Scale Distribution Function method computes the instantaneous
         # pressure from the distribution of scale factors that would just
         # bring each particle into contact with its nearest neighbour.
@@ -3106,7 +3281,8 @@ def main() -> None:
         # ------------------------------------------------------------------
         write_final_outputs(
             sim, mc, boxmc, params, files, start_time, seed,
-            args.simulparam_file
+            args.simulparam_file,
+            box_tuning_result=box_tuning_result,
         )
 
     except Exception as exc:
@@ -3154,7 +3330,7 @@ def main() -> None:
             try:
                 ef = f"emergency_restart_{params.tag}.gsd"
                 _write_snapshot(sim, mc, ef)
-                root_print(f"[ERROR] Emergency snapshot → {ef}")
+                root_print(f"[ERROR] Emergency snapshot => {ef}")
             except Exception as snap_exc:
                 root_print(
                     f"[ERROR] Could not write emergency snapshot: "
