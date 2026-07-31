@@ -167,13 +167,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "trajectory": "trajectory.gsd",
     "output_dir": "outputs",
 
-    # ── frame selection ─────────────────────────────────────────────────────
-    # frame_average : true  → accumulate/pool across all selected frames
-    #                 false → only the very last selected frame is analysed
-    "frame_average": True,
-    "frame_start"  : 0,        # first frame index (0-based, inclusive)
-    "frame_end"    : -1,       # last frame index (-1 = last in trajectory)
-    "frame_step"   : 1,        # stride between consecutive frames
+    # ── frame selection from the END of the trajectory ──────────────────────
+    # frame_average : false → analyse only the final trajectory frame
+    #                 true  → analyse the last num_frames frames, separated by
+    #                         frame_step, always including the final frame
+    "frame_average": False,
+    "num_frames"  : 30,
+    "frame_step"  : 1,
 
     # ── neighbour query ─────────────────────────────────────────────────────
     # use_num_neighbors : true  → {"num_neighbors": N} query
@@ -194,6 +194,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "bins"              : 100,
         "r_max"             : 5.0,
         "r_min"             : 0.0,
+        "r_cut"             : None,  # must be supplied explicitly in user JSON
         "normalization_mode": "exact"
     },
 
@@ -304,30 +305,92 @@ def open_trajectory(gsd_path: str | Path, logger: logging.Logger):
 
 def resolve_frame_indices(
     traj,
-    start: int,
-    end: int,
+    frame_average: bool,
+    num_frames: int,
     step: int,
     logger: logging.Logger,
 ) -> List[int]:
     """
-    Convert user-supplied frame_start / frame_end / frame_step into a
-    concrete list of integer frame indices, respecting trajectory length
-    and negative indexing.
+    Select frames relative to the END of the trajectory.
 
-    Raises
-    ------
-    ValueError   If the selection produces an empty frame list.
+    Rules
+    -----
+    * frame_average=False:
+        Return only the final frame, [N_total - 1].
+    * frame_average=True:
+        Return up to ``num_frames`` frame indices, separated by ``step``,
+        counting backward from the final frame and then reordered into
+        chronological order.
+
+    Example
+    -------
+    For a trajectory containing N_total frames, ``num_frames=6`` and
+    ``step=1`` select the final six zero-based indices:
+
+        [N_total-6, N_total-5, ..., N_total-1]
+
+    The returned order is chronological so that ``indices[-1]`` is always
+    the actual final trajectory frame.
     """
-    n = len(traj)
-    end_resolved = n + end + 1 if end < 0 else min(end, n)
-    indices = list(range(start, end_resolved, step))
-    if not indices:
-        raise ValueError(
-            f"Empty frame selection: start={start}, end={end}, step={step}, "
-            f"trajectory length={n}."
+    n_total = len(traj)
+
+    if n_total <= 0:
+        raise ValueError("Cannot select frames from an empty trajectory.")
+
+    if step <= 0:
+        raise ValueError(f"frame_step must be a positive integer; received {step}.")
+
+    last_index = n_total - 1
+
+    if not frame_average:
+        indices = [last_index]
+        logger.info(
+            "Frame averaging disabled: using only the final frame index %d.",
+            last_index,
         )
-    logger.info("  Frames selected : %d … %d  (step=%d, total=%d)",
-                indices[0], indices[-1], step, len(indices))
+        return indices
+
+    if num_frames <= 0:
+        raise ValueError(
+            f"num_frames must be a positive integer when frame_average=True; "
+            f"received {num_frames}."
+        )
+
+    # Maximum number of frames reachable while stepping backward from the
+    # final frame without producing a negative index.
+    max_available = last_index // step + 1
+    n_use = min(num_frames, max_available)
+
+    # Construct from newest to oldest, then reverse so downstream code sees
+    # chronological order and frames[-1] remains the newest/final frame.
+    newest_to_oldest = [last_index - k * step for k in range(n_use)]
+    indices = list(reversed(newest_to_oldest))
+
+    if n_use < num_frames:
+        logger.warning(
+            "Requested %d frame(s) from the trajectory end with step=%d, "
+            "but only %d frame(s) are available. Using all available frames.",
+            num_frames,
+            step,
+            n_use,
+        )
+
+    logger.info(
+        "Frame averaging enabled: selected %d frame(s) from the trajectory end "
+        "with step=%d.",
+        len(indices),
+        step,
+    )
+    if len(indices) <= 20:
+        logger.info("  Selected zero-based frame indices: %s", indices)
+    else:
+        logger.info(
+            "  Selected zero-based frame indices: %d ... %d  (total=%d)",
+            indices[0],
+            indices[-1],
+            len(indices),
+        )
+
     return indices
 
 
@@ -422,6 +485,7 @@ def save_fig(fig: plt.Figure, output_dir: Path, stem: str, dpi: int) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     fpath = output_dir / f"{stem}.png"
     fig.savefig(fpath, dpi=dpi, bbox_inches="tight")
+    plt.show()
     plt.close(fig)
     return fpath
 
@@ -434,115 +498,163 @@ def add_colorbar(ax, mappable, label: str):
 
 
 
-def run_rdf(traj, frames: List[int], cfg: Dict[str, Any], out: Path, log: logging.Logger) -> Dict[str, Any]:
+def _integrate_rdf_coordination_number(
+    bin_edges: np.ndarray,
+    gr: np.ndarray,
+    r_cut: float,
+    number_density: float,
+    is_2d: bool,
+) -> float:
     """
-    Compute the radial distribution function g(r) using ``freud.density.RDF``.
+    Integrate the RDF histogram from its configured r_min up to r_cut.
 
-    What this routine does
-    ----------------------
-    1. Validates the RDF-related user inputs from ``cfg["rdf"]``.
-    2. Builds the freud RDF object.
-    3. Iterates over the requested trajectory frames and accumulates RDF data.
-    4. Extracts physically useful summary quantities such as:
-         - first RDF peak position
-         - first RDF peak height
-         - first minimum after the first peak
-         - coordination number at that first minimum
-    5. Writes a two-panel diagnostic figure:
-         - g(r)
-         - cumulative coordination number n(r)
+    The RDF is treated as piecewise constant inside each histogram bin. The
+    shell measure is integrated exactly, including a partial final bin when
+    r_cut lies inside a bin.
 
-    Returns
-    -------
-    Dict[str, Any]
-        Summary dictionary. Returns {} only when RDF computation itself
-        could not be completed meaningfully.
+    3-D:
+        N_c = rho * integral[4*pi*r^2*g(r) dr]
+
+    2-D:
+        N_c = rho * integral[2*pi*r*g(r) dr]
     """
+    edges = np.asarray(bin_edges, dtype=np.float64)
+    values = np.asarray(gr, dtype=np.float64)
 
+    if edges.ndim != 1 or values.ndim != 1:
+        raise ValueError("RDF bin_edges and rdf arrays must both be one-dimensional.")
+    if edges.size != values.size + 1:
+        raise ValueError(
+            "RDF bin_edges must contain exactly one more element than rdf values."
+        )
+    if not np.all(np.diff(edges) > 0):
+        raise ValueError("RDF bin edges must be strictly increasing.")
+    if number_density <= 0 or not np.isfinite(number_density):
+        raise ValueError(
+            f"Number density must be finite and positive; received {number_density}."
+        )
+
+    lower = edges[:-1]
+    upper = np.minimum(edges[1:], r_cut)
+    mask = (lower < r_cut) & (upper > lower)
+
+    if not np.any(mask):
+        return 0.0
+
+    if not np.all(np.isfinite(values[mask])):
+        raise ValueError(
+            "RDF contains non-finite g(r) values inside the requested integration range."
+        )
+
+    if is_2d:
+        shell_measure = np.pi * (upper[mask] ** 2 - lower[mask] ** 2)
+    else:
+        shell_measure = (4.0 * np.pi / 3.0) * (
+            upper[mask] ** 3 - lower[mask] ** 3
+        )
+
+    return float(number_density * np.sum(values[mask] * shell_measure))
+
+
+def run_rdf(
+    traj,
+    frames: List[int],
+    cfg: Dict[str, Any],
+    out: Path,
+    log: logging.Logger,
+) -> Dict[str, Any]:
+    """
+    Compute g(r), integrate it up to the user-supplied r_cut, display the RDF
+    interactively, and save the figure after the interactive window closes.
+
+    No RDF peak or minimum is selected automatically. The coordination number
+    is calculated only from the explicit r_cut supplied in cfg["rdf"].
+    """
     # ------------------------------------------------------------------
-    # Step 1: Read and validate RDF configuration early.
+    # Step 1: Read and validate configuration.
     # ------------------------------------------------------------------
-    '''rdf_cfg   = cfg["rdf"]
-    bins      = int(rdf_cfg["bins"])
-    r_max     = float(rdf_cfg["r_max"])
-    r_min     = float(rdf_cfg["r_min"])
-    norm_mode = str(rdf_cfg["normalization_mode"])
-
-    log.info("── RDF  (bins=%d, r_min=%.2f, r_max=%.2f, norm=%s) ──────────",
-             bins, r_min, r_max, norm_mode)'''
-
-
     try:
         rdf_cfg = cfg["rdf"]
-    except KeyError:
-        log.error(
-            "RDF configuration missing: expected cfg['rdf'] in the JSON config."
-        )
-        return {}
-
-    try:
         bins = int(rdf_cfg["bins"])
         r_max = float(rdf_cfg["r_max"])
         r_min = float(rdf_cfg["r_min"])
+        r_cut_raw = rdf_cfg["r_cut"]
         norm_mode = str(rdf_cfg["normalization_mode"]).strip()
     except KeyError as exc:
         log.error(
-            "RDF configuration is incomplete. Missing key: %s. "
-            "Required keys are: bins, r_min, r_max, normalization_mode.",
+            "RDF configuration is incomplete. Missing key: %s. Required keys "
+            "are bins, r_min, r_max, r_cut, and normalization_mode.",
             exc,
         )
         log.debug(traceback.format_exc())
         return {}
     except (TypeError, ValueError) as exc:
-        log.error(
-            "RDF configuration contains invalid value type(s): %s. "
-            "Please check bins/r_min/r_max/normalization_mode in params JSON.",
-            exc,
-        )
+        log.error("RDF configuration contains invalid value type(s): %s", exc)
         log.debug(traceback.format_exc())
+        return {}
+
+    if r_cut_raw is None:
+        log.error(
+            "RDF config error: 'r_cut' must be supplied explicitly as a number."
+        )
+        return {}
+
+    try:
+        r_cut = float(r_cut_raw)
+    except (TypeError, ValueError) as exc:
+        log.error("RDF config error: 'r_cut' must be numeric. Error: %s", exc)
         return {}
 
     if bins <= 0:
         log.error("RDF config error: 'bins' must be > 0, but got %d.", bins)
         return {}
-
     if r_min < 0:
         log.error("RDF config error: 'r_min' must be >= 0, but got %.6f.", r_min)
         return {}
-
-    if r_max <= 0:
-        log.error("RDF config error: 'r_max' must be > 0, but got %.6f.", r_max)
-        return {}
-
     if r_max <= r_min:
         log.error(
-            "RDF config error: 'r_max' must be greater than 'r_min'. "
-            "Received r_min=%.6f, r_max=%.6f.",
+            "RDF config error: require r_max > r_min, but received "
+            "r_min=%.6f and r_max=%.6f.",
             r_min,
             r_max,
         )
         return {}
-
-    allowed_norm_modes = {"exact", "finite_size"}
-    if norm_mode not in allowed_norm_modes:
+    if not (r_min < r_cut <= r_max):
         log.error(
-            "RDF config error: unsupported normalization_mode='%s'. "
-            "Allowed values are %s.",
+            "RDF config error: r_cut must satisfy r_min < r_cut <= r_max. "
+            "Received r_min=%.6f, r_cut=%.6f, r_max=%.6f.",
+            r_min,
+            r_cut,
+            r_max,
+        )
+        return {}
+
+    if norm_mode != "exact":
+        log.error(
+            "RDF coordination integration requires normalization_mode='exact'. "
+            "The 'finite_size' mode rescales g(r) by N/(N-1), which would "
+            "rescale the integrated coordination number as well. Received '%s'.",
             norm_mode,
-            sorted(allowed_norm_modes),
         )
         return {}
 
     if not frames:
-        log.error(
-            "RDF aborted: no frames were provided to run_rdf(). "
-        )
+        log.error("RDF aborted: no frames were supplied.")
         return {}
 
+    if r_min > 0:
+        log.warning(
+            "RDF coordination integration will begin at r_min=%.6f, not at zero. "
+            "Any contribution from 0 <= r < r_min is intentionally omitted.",
+            r_min,
+        )
+
     log.info(
-        "── RDF  (bins=%d, r_min=%.4f, r_max=%.4f, norm=%s, n_frames=%d) ──────────",
+        "── RDF (bins=%d, r_min=%.4f, r_cut=%.4f, r_max=%.4f, "
+        "norm=%s, requested_frames=%d) ──",
         bins,
         r_min,
+        r_cut,
         r_max,
         norm_mode,
         len(frames),
@@ -559,302 +671,190 @@ def run_rdf(traj, frames: List[int], cfg: Dict[str, Any], out: Path, log: loggin
             normalization_mode=norm_mode,
         )
     except Exception as exc:
-        log.error("  RDF init failed: %s", exc)
+        log.error("RDF initialization failed: %s", exc)
         log.debug(traceback.format_exc())
         return {}
 
     # ------------------------------------------------------------------
-    # Step 3: Loop over frames and accumulate RDF statistics.
+    # Step 3: Accumulate RDF statistics and record frame densities.
     # ------------------------------------------------------------------
     first_successful_compute = True
     n_ok = 0
     n_skipped = 0
     skipped_frames: List[int] = []
+    number_densities: List[float] = []
+    dimensionality_flags: List[bool] = []
 
     for fi in frames:
         try:
             fd = extract_frame_data(traj[fi])
             system = (fd["box"], fd["positions"])
-        except IndexError as exc:
-            log.warning(
-                "RDF frame %d skipped: frame index is out of range for this trajectory. "
-                "Error: %s",
-                fi,
-                exc,
-            )
-            log.debug(traceback.format_exc())
-            n_skipped += 1
-            skipped_frames.append(fi)
-            continue
-        except Exception as exc:
-            log.warning(
-                "RDF frame %d skipped while extracting trajectory data. "
-                "Possible causes: malformed frame, missing particle data, incompatible GSD content. "
-                "Error: %s",
-                fi,
-                exc,
-            )
-            log.debug(traceback.format_exc())
-            n_skipped += 1
-            skipped_frames.append(fi)
-            continue
-
-        try:
-            # reset=True only for the first successful compute call.
             rdf.compute(system, reset=first_successful_compute)
+
             first_successful_compute = False
             n_ok += 1
+            number_densities.append(float(fd["N"] / fd["box"].volume))
+            dimensionality_flags.append(bool(fd["box"].is2D))
         except Exception as exc:
-            log.warning(
-                "RDF frame %d skipped during freud.density.RDF.compute(...). "
-                "This can happen if the box/positions are inconsistent or the frame is invalid. "
-                "Error: %s",
-                fi,
-                exc,
-            )
+            log.warning("RDF frame %d skipped: %s", fi, exc)
             log.debug(traceback.format_exc())
             n_skipped += 1
             skipped_frames.append(fi)
 
-    # If every frame failed, there is nothing meaningful to return.
     if n_ok == 0:
         log.error(
-            "RDF failed: all %d requested frame(s) were skipped. "
-            "Skipped frames: %s",
+            "RDF failed: all %d requested frame(s) were skipped. Skipped=%s",
             len(frames),
             skipped_frames,
         )
         return {}
 
-    if n_skipped > 0:
+    if len(set(dimensionality_flags)) != 1:
+        log.error(
+            "RDF coordination integration aborted because successful frames mix "
+            "2-D and 3-D simulation boxes."
+        )
+        return {}
+
+    is_2d = dimensionality_flags[0]
+    rho_mean = float(np.mean(number_densities))
+    rho_min = float(np.min(number_densities))
+    rho_max = float(np.max(number_densities))
+
+    if n_skipped:
         log.warning(
-            "RDF completed with partial success: %d frame(s) processed, %d skipped.",
+            "RDF completed with partial success: %d frame(s) used, %d skipped.",
             n_ok,
             n_skipped,
         )
 
+    if n_ok > 1 and not np.allclose(
+        number_densities,
+        rho_mean,
+        rtol=1.0e-6,
+        atol=1.0e-12,
+    ):
+        log.warning(
+            "Number density varies across the selected frames: min=%.8g, "
+            "mean=%.8g, max=%.8g. Coordination is integrated using the mean "
+            "number density.",
+            rho_min,
+            rho_mean,
+            rho_max,
+        )
+
     # ------------------------------------------------------------------
-    # Step 4: Extract RDF arrays safely.
+    # Step 4: Extract g(r) and integrate to the explicit r_cut.
     # ------------------------------------------------------------------
     try:
         r = np.asarray(rdf.bin_centers, dtype=np.float64)
+        bin_edges = np.asarray(rdf.bin_edges, dtype=np.float64)
         gr = np.asarray(rdf.rdf, dtype=np.float64)
-        nr = np.asarray(rdf.n_r, dtype=np.float64)  # cumulative coordination number
     except Exception as exc:
-        log.error(
-            "RDF post-processing failed while reading bin_centers/rdf/n_r "
-            "from the freud RDF object. Error: %s",
-            exc,
-        )
+        log.error("Could not extract RDF arrays from freud: %s", exc)
         log.debug(traceback.format_exc())
         return {}
 
-    if r.size == 0 or gr.size == 0 or nr.size == 0:
-        log.error(
-            "RDF produced empty output arrays. "
-        )
+    if r.size == 0 or gr.size == 0 or bin_edges.size == 0:
+        log.error("RDF produced one or more empty output arrays.")
         return {}
 
+    try:
+        coordination_number = _integrate_rdf_coordination_number(
+            bin_edges=bin_edges,
+            gr=gr,
+            r_cut=r_cut,
+            number_density=rho_mean,
+            is_2d=is_2d,
+        )
+    except Exception as exc:
+        log.error("RDF coordination-number integration failed: %s", exc)
+        log.debug(traceback.format_exc())
+        return {}
+
+    summary: Dict[str, Any] = {
+        "rdf_coordination_number": float(coordination_number),
+        "rdf_r_cut": float(r_cut),
+        "rdf_number_density_mean": float(rho_mean),
+        "rdf_dimension": 2 if is_2d else 3,
+        "rdf_n_frames_used": int(n_ok),
+        "rdf_n_frames_skipped": int(n_skipped),
+        "rdf_r_min": float(r_min),
+        "rdf_r_max": float(r_max),
+        "rdf_gr_max": float(np.nanmax(gr)),
+        "rdf_gr_min": float(np.nanmin(gr)),
+    }
+
+    # Log a plain-text copy and print a bold terminal result.
+    log.info(
+        "Coordination number integrated from r=%.6f to r_cut=%.6f: %.8f",
+        r_min,
+        r_cut,
+        coordination_number,
+    )
+    separator = "=" * 84
+    bold_message = (
+        f"COORDINATION NUMBER  [r_min={r_min:.6f}, r_cut={r_cut:.6f}]  "
+        f"= {coordination_number:.8f}"
+    )
+    print("\n" + separator)
+    print(f"\033[1m{bold_message}\033[0m")
+    print(separator + "\n")
 
     # ------------------------------------------------------------------
-    # Step 5: Derive physical peak/minimum information.
-    # ------------------------------------------------------------------
-    summary = _extract_rdf_peaks(r, gr, nr, log)
-
-    # Add a few generic diagnostics even if no clear peak/minimum is found.
-    summary["rdf_n_frames_used"] = int(n_ok)
-    summary["rdf_n_frames_skipped"] = int(n_skipped)
-    summary["rdf_r_min"] = float(r[0])
-    summary["rdf_r_max"] = float(r[-1])
-    summary["rdf_gr_max"] = float(np.nanmax(gr))
-    summary["rdf_gr_min"] = float(np.nanmin(gr))
-
-    # Coordination number at first minimum, if the minimum exists.
-    if "rdf_r1_min" in summary:
-        try:
-            r_min_loc = summary["rdf_r1_min"]
-            n_at_min = float(np.interp(r_min_loc, r, nr))
-            summary["rdf_coordination_number"] = n_at_min
-        except Exception as exc:
-            log.warning(
-                "Could not interpolate coordination number at the first RDF minimum. "
-                "Error: %s",
-                exc,
-            )
-            log.debug(traceback.format_exc())
-
-    # ------------------------------------------------------------------
-    # Step 6: Plotting.
+    # Step 5: Display the RDF interactively first, then save it.
     # ------------------------------------------------------------------
     try:
         apply_style()
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-        # Panel 0: g(r)
-        ax0 = axes[0]
-        ax0.plot(r, gr, color="steelblue", lw=1.8)
-        # ax0.axhline(1.0, color="grey", ls=":", lw=0.8, label="g(r)=1 (ideal gas)")
-        ax0.set_xlabel(r"$r$ ")
-        ax0.set_ylabel(r"$g(r)$")
-        ax0.set_title("Radial Distribution Function")
-        ax0.set_xlim(r[0], r[-1])
-        ax0.set_ylim(bottom=0)
-        ax0.legend(fontsize=9)
-        # _add_averaging_note(ax0, True, n_ok)
-
-        # Annotate the first peak if found.
-        '''if "rdf_r1" in summary and "rdf_g1" in summary:
-            r1 = summary["rdf_r1"]
-            g1 = summary["rdf_g1"]
-            ax0.axvline(r1, color="crimson", ls="--", lw=1.0, alpha=0.8)
-            ax0.text(
-                r1 + 0.05,
-                g1 * 0.92,
-                f"r* = {r1:.3f}\ng(r*) = {g1:.2f}",
-                fontsize=8,
-                color="crimson",
-                va="top",
-            )
-        else:
-            log.info(
-                "RDF note: no clear first peak satisfying the current peak rule "
-                "(local maximum with g(r) > 1) was found."
-            )'''
-
-        # Panel 1: cumulative coordination number n(r)
-        ax1 = axes[1]
-        ax1.plot(r, nr, color="darkorange", lw=1.8)
-        ax1.set_xlabel(r"$r$")
-        ax1.set_ylabel(r"$n(r)$  (cumulative coordination number)")
-        ax1.set_title("Cumulative Coordination Number")
-        ax1.set_xlim(r[0], r[-1])
-        ax1.set_ylim(bottom=0)
-        # _add_averaging_note(ax1, True, n_ok)
-
-        # Annotate first minimum after first peak, if present.
-        if "rdf_r1_min" in summary and "rdf_coordination_number" in summary:
-            r_min_loc = summary["rdf_r1_min"]
-            n_at_min = summary["rdf_coordination_number"]
-            ax1.axvline(r_min_loc, color="crimson", ls="--", lw=1.0, alpha=0.8)
-            ax1.text(
-                r_min_loc + 0.05,
-                max(n_at_min * 0.5, 0.05),
-                f"N_c ~ {n_at_min:.1f}\n(r = {r_min_loc:.3f})",
-                fontsize=8,
-                color="crimson",
-            )
-        else:
-            log.info(
-                "RDF note: no clear first minimum after the first peak was found, "
-                "so coordination-number annotation was skipped."
-            )
-
-        fig.suptitle("freud.density.RDF", fontsize=13, y=1.01)
+        fig, ax = plt.subplots(figsize=cfg["figure_size"])
+        ax.plot(r, gr, lw=1.8, label=r"$g(r)$")
+        ax.axhline(1.0, ls=":", lw=0.9, label=r"$g(r)=1$")
+        ax.axvline(
+            r_cut,
+            ls="--",
+            lw=1.2,
+            label=rf"$r_{{cut}}={r_cut:.4f}$",
+        )
+        ax.set_xlabel(r"$r$")
+        ax.set_ylabel(r"$g(r)$")
+        ax.set_title("Radial Distribution Function")
+        ax.set_xlim(r_min, r_max)
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=9)
+        _add_averaging_note(ax, n_ok)
         fig.tight_layout()
 
-        fpath = save_fig(fig, out, "16_rdf", cfg["dpi"])
-        log.info("  Saved RDF figure => %s", fpath)
+        out.mkdir(parents=True, exist_ok=True)
+        fpath = out / "16_rdf.png"
+
+        backend = str(matplotlib.get_backend()).lower()
+        noninteractive_backends = {"agg", "pdf", "ps", "svg", "cairo", "template", "pgf"}
+        if backend in noninteractive_backends:
+            log.warning(
+                "Matplotlib backend '%s' is non-interactive; the RDF window "
+                "cannot be displayed. Saving the figure directly.",
+                matplotlib.get_backend(),
+            )
+        else:
+            log.info(
+                "Displaying the interactive RDF plot. Close the plot window to "
+                "continue; the PNG will then be saved."
+            )
+            plt.show(block=True)
+
+        # Figure.savefig remains valid after blocking show because we retain the
+        # explicit Figure object in 'fig'.
+        fig.savefig(fpath, dpi=cfg["dpi"], bbox_inches="tight")
+        plt.close(fig)
+        log.info("Saved RDF figure => %s", fpath)
 
     except Exception as exc:
         log.error(
-            "RDF plotting/saving failed, but numerical RDF results were computed successfully. "
-            "Error: %s",
+            "RDF plotting/saving failed, but numerical RDF and coordination "
+            "results were computed successfully. Error: %s",
             exc,
         )
         log.debug(traceback.format_exc())
-
-    return summary
-
-
-
-def _extract_rdf_peaks(r: np.ndarray, gr: np.ndarray, nr: np.ndarray, log: logging.Logger) -> Dict[str, Any]:
-
-    """
-    Identify the first physically relevant RDF peak and the first minimum
-    immediately after that peak.
-
-    Peak selection rule
-    -------------------
-    We look for the *first* local maximum satisfying:
-        gr[i] > gr[i-1], gr[i] > gr[i+1], and gr[i] > 1
-
-    Minimum selection rule
-    ----------------------
-    Once the first peak is found, we search forward for the next local
-    minimum:
-        gr[j] < gr[j-1] and gr[j] < gr[j+1]
-
-    That minimum usually marks the end of the first coordination shell.
-
-    Returns
-    -------
-    Dict[str, Any]
-        May contain:
-          - rdf_r1
-          - rdf_g1
-          - rdf_r1_index
-          - rdf_r1_min
-          - rdf_r1_min_index
-
-        If no peak or no minimum is found, the function returns a partial
-        dictionary and logs a helpful message.
-    """
-
-    summary: Dict[str, Any] = {}
-
-    # -------------------- basic sanity checks ---------------------------
-    if r is None or gr is None or nr is None:
-        log.warning("RDF peak extraction skipped: one or more input arrays are None.")
-        return summary
-
-
-    # -------------------- find first meaningful peak --------------------
-    peak_index: Optional[int] = None
-
-    for i in range(1, len(gr) - 1):
-        left = gr[i - 1]
-        mid = gr[i]
-        right = gr[i + 1]
-
-        # Ignore non-finite data points explicitly.
-        if not (np.isfinite(left) and np.isfinite(mid) and np.isfinite(right)):
-            continue
-
-        if mid > left and mid > right and mid > 1.0:
-            peak_index = i
-            summary["rdf_r1"] = float(r[i])
-            summary["rdf_g1"] = float(gr[i])
-            summary["rdf_r1_index"] = int(i)
-            log.info("RDF first peak found at bin %d: r=%.6f, g(r)=%.6f", i, r[i], gr[i])
-            break
-
-    if peak_index is None:
-        log.warning("No clear first RDF peak was found. ")
-        return summary
-
-    # -------------------- find first minimum after peak -----------------
-    min_index: Optional[int] = None
-
-    for j in range(peak_index + 1, len(gr) - 1):
-        left = gr[j - 1]
-        mid = gr[j]
-        right = gr[j + 1]
-
-        if not (np.isfinite(left) and np.isfinite(mid) and np.isfinite(right)):
-            continue
-
-        if mid < left and mid < right:
-            min_index = j
-            summary["rdf_r1_min"] = float(r[j])
-            summary["rdf_r1_min_index"] = int(j)
-            log.info("RDF first minimum after first peak found at bin %d: r=%.6f, g(r)=%.6f", j, r[j], gr[j])
-            break
-
-    if min_index is None:
-        log.warning(
-            "First RDF peak was found, but no subsequent local minimum was detected. "
-            "Coordination-shell boundary could not be assigned automatically."
-        )
 
     return summary
 
@@ -924,6 +924,7 @@ def run_correlation_function(
         return {}
 
     first = True
+    n_ok = 0
     for fi in frames:
         fd = extract_frame_data(traj[fi])
 
@@ -943,6 +944,7 @@ def run_correlation_function(
                 reset=first,
             )
             first = False
+            n_ok += 1
         except Exception as exc:
             log.warning("  CorrelationFunction frame %d: %s", fi, exc)
             log.debug(traceback.format_exc())
@@ -977,7 +979,7 @@ def run_correlation_function(
     ax0.set_title(f"Spatial Correlation Function  [{title_sym}]")
     ax0.set_xlim(r[0], r[-1])
     ax0.legend(fontsize=9)
-    _add_averaging_note(ax0, True, len(frames))
+    _add_averaging_note(ax0, n_ok)
 
     # Panel 1: C(r) on log-linear scale for decay visualisation
     ax1 = axes[1]
@@ -991,6 +993,7 @@ def run_correlation_function(
     ax1.set_ylabel(r"$\mathrm{Re}[C(r)]$  (log scale)")
     ax1.set_title("Correlation Function (log scale)")
     ax1.set_xlim(r[0], r[-1])
+    _add_averaging_note(ax1, n_ok)
 
     fig.suptitle("freud.density.CorrelationFunction", fontsize=13, y=1.01)
     fig.tight_layout()
@@ -1000,8 +1003,9 @@ def run_correlation_function(
     summary: Dict[str, Any] = {
         "cf_C_r_min"  : float(np.nanmin(C_r)),
         "cf_C_r_max"  : float(np.nanmax(C_r)),
-        "cf_value_mode": vmode,
-        "cf_symmetry_k": sym_k,
+        "cf_value_mode"   : vmode,
+        "cf_symmetry_k"   : sym_k,
+        "cf_n_frames_used": int(n_ok),
     }
     if xi is not None:
         summary["cf_correlation_length_xi"] = float(xi)
@@ -1139,6 +1143,7 @@ def run_local_density(
 
     all_densities: List[np.ndarray] = []
     all_nneighbors: List[np.ndarray] = []
+    successful_frames: List[int] = []
 
     for fi in frames:
         fd     = extract_frame_data(traj[fi])
@@ -1147,6 +1152,7 @@ def run_local_density(
             ld.compute(system)
             all_densities.append(np.asarray(ld.density, dtype=np.float64))
             all_nneighbors.append(np.asarray(ld.num_neighbors, dtype=np.float64))
+            successful_frames.append(fi)
         except Exception as exc:
             log.warning("  LocalDensity frame %d: %s", fi, exc)
             log.debug(traceback.format_exc())
@@ -1155,14 +1161,20 @@ def run_local_density(
         log.error("  LocalDensity: all frames failed.")
         return {}
 
-    # Pool all frames for distribution; keep last-frame spatial map
+    # Pool all successfully processed frames for the distributions; keep the
+    # spatial map from the newest successfully processed frame.
+    n_density_frames = len(all_densities)
     pool_dens  = np.concatenate(all_densities)
     pool_nn    = np.concatenate(all_nneighbors)
     last_dens  = all_densities[-1]
-    last_pos   = extract_frame_data(traj[frames[-1]])["positions"]
 
-    # Bulk density from last frame
-    fd_last    = extract_frame_data(traj[frames[-1]])
+    # Use the newest frame whose LocalDensity computation actually succeeded,
+    # ensuring that the plotted positions and density values correspond.
+    last_successful_frame = successful_frames[-1]
+    fd_last    = extract_frame_data(traj[last_successful_frame])
+    last_pos   = fd_last["positions"]
+
+    # Bulk density from the same newest successful frame.
     box        = fd_last["box"]
     rho_bulk   = float(fd_last["N"] / box.volume)
 
@@ -1182,7 +1194,7 @@ def run_local_density(
     ax0.set_ylabel("Probability density")
     ax0.set_title("Per-Particle Local Density Distribution")
     ax0.legend(fontsize=8)
-    _add_averaging_note(ax0, True, len(frames))
+    _add_averaging_note(ax0, n_density_frames)
 
     # Panel 1: number of neighbours distribution
     ax1 = fig.add_subplot(gs[1])
@@ -1191,7 +1203,7 @@ def run_local_density(
     ax1.set_xlabel("Number of neighbours within r_max")
     ax1.set_ylabel("Count")
     ax1.set_title("Neighbour Count Distribution")
-    _add_averaging_note(ax1, True, len(frames))
+    _add_averaging_note(ax1, n_density_frames)
 
     # Panel 2: 2-D spatial density map (last frame)
     ax2 = fig.add_subplot(gs[2])
@@ -1203,9 +1215,9 @@ def run_local_density(
     add_colorbar(ax2, sc, r"$\rho_\mathrm{local}$")
     ax2.set_xlabel("x")
     ax2.set_ylabel("y")
-    ax2.set_title(f"Local Density Map  (frame {frames[-1]})")
+    ax2.set_title(f"Local Density Map  (frame {last_successful_frame})")
     ax2.set_aspect("equal")
-    _add_averaging_note(ax2, False, 1)
+    _add_averaging_note(ax2, 1)
 
     fig.suptitle("freud.density.LocalDensity", fontsize=13, y=1.02)
     fpath = save_fig(fig, out, "18_local_density", cfg["dpi"])
@@ -1217,7 +1229,9 @@ def run_local_density(
         "local_density_min"   : float(np.min(pool_dens)),
         "local_density_max"   : float(np.max(pool_dens)),
         "local_density_bulk"  : float(rho_bulk),
-        "local_density_mean_nn": float(np.mean(pool_nn)),
+        "local_density_mean_nn"     : float(np.mean(pool_nn)),
+        "local_density_n_frames_used"   : int(n_density_frames),
+        "local_density_map_frame"       : int(last_successful_frame),
     }
 
 
@@ -1323,11 +1337,13 @@ def run_gaussian_density(
         add_colorbar(ax, im, r"$\rho(\mathbf{r})$")
         ax.set_xlabel("x bin")
         ax.set_ylabel("y bin")
-        ax.set_title(
-            f"Gaussian Density Field (2-D)  –  "
-            + ("avg over frames" if force_avg else f"frame {active_frames[-1]}")
+        frame_info = (
+            f"average over {n_accum} frames"
+            if n_accum > 1
+            else f"frame {active_frames[-1]}"
         )
-        _add_averaging_note(ax, force_avg, n_accum)
+        ax.set_title(f"Gaussian Density Field (2-D)  –  {frame_info}")
+        _add_averaging_note(ax, n_accum)
     else:
         # 3-D: show three orthogonal 2-D slices through the centre
         nx, ny, nz = field.shape
@@ -1347,11 +1363,16 @@ def run_gaussian_density(
             ax_s.set_ylabel(ylabel)
         fig.colorbar(im, ax=axes[-1], fraction=0.046, pad=0.04,
                      label=r"$\rho(\mathbf{r})$")
-        frame_info = "avg over frames" if force_avg else f"frame {active_frames[-1]}"
+        frame_info = (
+            f"average over {n_accum} frames"
+            if n_accum > 1
+            else f"frame {active_frames[-1]}"
+        )
         fig.suptitle(
             f"freud.density.GaussianDensity  –  3-D orthogonal slices  ({frame_info})",
             fontsize=12, y=1.01,
         )
+        _add_averaging_note(axes[0], n_accum)
 
     fig.tight_layout()
     fpath = save_fig(fig, out, "19_gaussian_density", cfg["dpi"])
@@ -1361,7 +1382,8 @@ def run_gaussian_density(
         "gaussian_density_max"  : float(np.max(field)),
         "gaussian_density_mean" : float(np.mean(field)),
         "gaussian_density_std"  : float(np.std(field)),
-        "gaussian_density_frame": int(active_frames[-1]),
+        "gaussian_density_frame"        : int(active_frames[-1]),
+        "gaussian_density_n_frames_used": int(n_accum),
     }
 
 
@@ -1436,7 +1458,7 @@ def run_sphere_voxelization(
                    cmap="binary", interpolation="nearest")
         ax0.set_title(f"Sphere Voxelization (2-D)  –  frame {fi}")
         ax0.set_xlabel("x bin"); ax0.set_ylabel("y bin")
-        _add_averaging_note(ax0, False, 1)
+        _add_averaging_note(ax0, 1)
 
         # Row-sum density profile (x-projection)
         profile = np.sum(voxels, axis=1) / voxels.shape[1]
@@ -1458,7 +1480,7 @@ def run_sphere_voxelization(
             axi.imshow(sl, origin="lower", aspect="equal",
                        cmap="binary", interpolation="nearest")
             axi.set_title(title); axi.set_xlabel(xl + " bin"); axi.set_ylabel(yl + " bin")
-        _add_averaging_note(axes[0], False, 1)
+        _add_averaging_note(axes[0], 1)
         fig.suptitle(
             f"freud.density.SphereVoxelization  –  frame {fi}"
             f"\nφ = {packing_frac:.4f}  ({n_occupied}/{n_total} voxels)",
@@ -1482,25 +1504,60 @@ def run_sphere_voxelization(
 # ⑥  ANNOTATION HELPER
 # =============================================================================
 
-def _add_averaging_note(ax, averaged: bool, n_frames: int):
+def _add_averaging_note(ax, n_frames: int):
     """
-    Add a small annotation in the upper-left corner of *ax* stating
-    whether this panel used frame-averaged data and over how many frames.
+    Annotate a plot with the frame mode actually used to create that panel.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes receiving the annotation.
+    n_frames : int
+        Number of successfully processed frames represented by the panel.
+        A value of 1 is labelled ``Last frame only``; values greater than 1
+        are labelled ``Frame-averaged (n=...)``.
+
+    Notes
+    -----
+    The label is derived from the actual processed-frame count rather than
+    directly from ``cfg["frame_average"]``. This remains correct when one or
+    more requested frames fail during an analysis.
     """
-    if averaged:
+    try:
+        n_frames = int(n_frames)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"n_frames must be an integer-like value; received {n_frames!r}."
+        ) from exc
+
+    if n_frames <= 0:
+        raise ValueError(
+            f"n_frames must be positive for a completed plot; received {n_frames}."
+        )
+
+    if n_frames > 1:
         label = f"Frame-averaged  (n={n_frames})"
         color = "#1a7f1a"
     else:
         label = "Last frame only"
         color = "#8b0000"
+
     ax.text(
-        0.02, 0.98, label,
+        0.02,
+        0.98,
+        label,
         transform=ax.transAxes,
-        ha="left", va="top",
+        ha="left",
+        va="top",
         fontsize=8,
         color=color,
         style="italic",
-        bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.6, ec=color),
+        bbox=dict(
+            boxstyle="round,pad=0.2",
+            fc="white",
+            alpha=0.6,
+            ec=color,
+        ),
     )
 
 
@@ -1515,7 +1572,7 @@ def _add_averaging_note(ax, averaged: bool, n_frames: int):
 #     "rdf"                  : True,
 #     "correlation_function" : True,
 #     "local_density"        : True,
-#     "gaussian_density"     : False,   # default last frame; override available
+#     "gaussian_density"     : True,    # averaging available via override
 #     "sphere_voxelization"  : False,   # last frame only
 #
 #   ANALYSIS_DISPLAY_NAMES additions:
@@ -1529,7 +1586,7 @@ FRAME_AVG_SUPPORT = {
     "rdf"                  : True,
     "correlation_function" : True,
     "local_density"        : True,
-    "gaussian_density"     : False,
+    "gaussian_density"     : True,
     "sphere_voxelization"  : False,
 }
 
@@ -1574,17 +1631,48 @@ def print_summary(
             continue
 
         supports_avg = FRAME_AVG_SUPPORT[key]
-        want_avg     = cfg["frame_average"]
+        want_avg = bool(cfg["frame_average"])
+        res = results.get(key, {})
 
-        if supports_avg and want_avg:
-            mode_str = f"frame-avg ({n_frames} frames)"
-        elif supports_avg:
-            mode_str = "last frame (avg=OFF)"
-        else:
-            mode_str = "last frame  ★ always"
+        # Prefer the number of frames actually processed by the analysis.
+        frame_count_keys = {
+            "rdf"                 : "rdf_n_frames_used",
+            "correlation_function": "cf_n_frames_used",
+            "local_density"       : "local_density_n_frames_used",
+            "gaussian_density"    : "gaussian_density_n_frames_used",
+        }
+        count_key = frame_count_keys.get(key)
+        actual_n_frames = (
+            int(res[count_key])
+            if count_key is not None and count_key in res
+            else None
+        )
 
-        res  = results.get(key, {})
-        ok   = bool(res)
+        # When an analysis failed before reporting its processed-frame count,
+        # show the frame mode that was requested by the configuration.
+        if actual_n_frames is None:
+            if key == "sphere_voxelization":
+                actual_n_frames = 1
+            elif key == "gaussian_density":
+                override = bool(
+                    cfg.get("gaussian_density", {}).get(
+                        "frame_average_override",
+                        False,
+                    )
+                )
+                actual_n_frames = n_frames if (want_avg and override) else 1
+            elif supports_avg and want_avg:
+                actual_n_frames = n_frames
+            else:
+                actual_n_frames = 1
+
+        mode_str = (
+            f"frame-avg ({actual_n_frames} frames)"
+            if actual_n_frames > 1
+            else "last frame only"
+        )
+
+        ok = bool(res)
         stat = "✓ OK" if ok else "✗ FAIL"
 
         kresult = ""
@@ -1611,6 +1699,7 @@ def print_summary(
 def save_summary_json(
     results: Dict[str, Any],
     cfg: Dict[str, Any],
+    selected_frames: List[int],
     out: Path,
     log: logging.Logger,
 ):
@@ -1618,11 +1707,11 @@ def save_summary_json(
     payload = {
         "run_timestamp": datetime.now().isoformat(),
         "trajectory"   : cfg["trajectory"],
-        "frame_average": cfg["frame_average"],
-        "frame_start"  : cfg["frame_start"],
-        "frame_end"    : cfg["frame_end"],
-        "frame_step"   : cfg["frame_step"],
-        "results"      : results,
+        "frame_average"        : cfg["frame_average"],
+        "num_frames_requested"  : cfg["num_frames"],
+        "frame_step"            : cfg["frame_step"],
+        "selected_frame_indices": selected_frames,
+        "results"               : results,
     }
     path = out / "summary.json"
     with open(path, "w") as fh:
@@ -1658,18 +1747,21 @@ def main(config_path: str):
     log.info("Config : %s", Path(config_path).resolve())
     log.info("Output : %s", out_dir.resolve())
 
-    traj    = open_trajectory(cfg["trajectory"], log)
-    all_fi  = resolve_frame_indices(
-        traj,
-        cfg["frame_start"], cfg["frame_end"], cfg["frame_step"],
-        log,
+    traj = open_trajectory(cfg["trajectory"], log)
+
+    # Select frames relative to the trajectory end. When frame_average=False,
+    # resolve_frame_indices returns only the final frame. When True, it returns
+    # the requested number of end-relative frames in chronological order.
+    avg_frames = resolve_frame_indices(
+        traj=traj,
+        frame_average=bool(cfg["frame_average"]),
+        num_frames=int(cfg["num_frames"]),
+        step=int(cfg["frame_step"]),
+        logger=log,
     )
 
-    # For analyses that support averaging: use full list when frame_average=True,
-    # else fall back to [last frame].
-    avg_frames  = all_fi if cfg["frame_average"] else [all_fi[-1]]
-    snap_frames = all_fi        # snapshot analyses always get full list so they
-                                # can pick the last element themselves
+    # Snapshot analyses must always receive the actual final selected frame.
+    snap_frames = [avg_frames[-1]]
 
     results: Dict[str, Any] = {}
     t0 = time.perf_counter()
@@ -1716,7 +1808,7 @@ def main(config_path: str):
     log.info("All analyses finished in %.2f s.", elapsed)
 
     print_summary(cfg, results, len(avg_frames), log)
-    save_summary_json(results, cfg, out_dir, log)
+    save_summary_json(results, cfg, avg_frames, out_dir, log)
 
     traj.close()
     log.info("Done. Outputs in: %s", out_dir.resolve())

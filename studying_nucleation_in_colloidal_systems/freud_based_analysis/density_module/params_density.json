@@ -1,0 +1,54 @@
+{
+  "_comment": "freud.density standalone analysis parameter file for analyze_density.py. Set any 'enabled' to false to skip that analysis.",
+  "trajectory": "HOOMD_hard_Truncated_Cuboctahedron_4096_production_run_nvt_hpmc_pf0p593_output_traj.gsd",
+  "output_dir": "outputs",
+  "frame_average": true,
+  "num_frames": 35,
+  "frame_step": 1,
+  "num_neighbors": 12,
+  "r_max": 2.0,
+  "use_num_neighbors": true,
+  "dpi": 300,
+  "colormap": "viridis",
+  "figure_size": [
+    8,
+    6
+  ],
+  "rdf": {
+    "_comment": "RDF g(r). Set r_cut explicitly before running; coordination is integrated from r_min to r_cut.",
+    "enabled": true,
+    "bins": 100,
+    "r_min": 0.0,
+    "r_cut": 1.62,
+    "r_max": 4.0,
+    "normalization_mode": "exact"
+  },
+  "correlation_function": {
+    "_comment": "CorrelationFunction \u2013 complex pairwise spatial correlation C(r). value_mode='orientation_k' needs usable particle orientations in the GSD; 'ones' does not.",
+    "enabled": false,
+    "bins": 50,
+    "r_max": 5.0,
+    "value_mode": "orientation_k",
+    "symmetry_k": 4
+  },
+  "local_density": {
+    "_comment": "LocalDensity \u2013 per-particle local number density. r_max is the probe radius; diameter is the particle diameter.",
+    "enabled": false,
+    "r_max": 3.0,
+    "diameter": 1.0
+  },
+  "gaussian_density": {
+    "_comment": "GaussianDensity \u2013 Gaussian-blurred density field on a grid. Default behavior is snapshot-style unless frame_average_override is set true.",
+    "enabled": false,
+    "width": 128,
+    "r_max": 3.0,
+    "sigma": 0.5,
+    "frame_average_override": false
+  },
+  "sphere_voxelization": {
+    "_comment": "SphereVoxelization \u2013 binary voxel occupancy grid. Usually used as a last-frame snapshot analysis.",
+    "enabled": false,
+    "width": 64,
+    "r_max": 0.5
+  }
+}

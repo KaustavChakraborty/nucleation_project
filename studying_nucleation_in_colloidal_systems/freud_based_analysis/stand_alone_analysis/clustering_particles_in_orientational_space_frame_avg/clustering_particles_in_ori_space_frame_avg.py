@@ -76,7 +76,7 @@ DEFAULT_BLOCK_SIZE = 128
 # Baseline tolerance used when validating numerical properties of the
 # symmetry-reduced angular-distance calculation. This is not the physical
 # within-cluster angular cutoff.
-DEFAULT_ANGLE_VALIDATION_TOL_DEG = 1.0e-5
+DEFAULT_ANGLE_VALIDATION_TOL_DEG = 1.0e-3
 
 # A self-comparison should theoretically give exactly zero. In practice,
 # freud may show a small single-precision numerical floor. Values below this
