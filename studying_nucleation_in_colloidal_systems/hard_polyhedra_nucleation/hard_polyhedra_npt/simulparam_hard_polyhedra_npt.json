@@ -1,19 +1,22 @@
 {
     "_section_io":          "--- I/O identifiers ---",
-    "tag":                  "HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70",
-    "input_gsd_filename":   "HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P50_final.gsd",
+    "tag":                  "HOOMD_hard_Th_symm_body_4096_hpmc_npt_P70",
+    "input_gsd_filename":   "HOOMD_hard_Th_symm_body_4096_hpmc_npt_P50_final.gsd",
+
+    "_comment_input_gsd_frame": "Input GSD frame: -1 last, -2 second-last, 0 first.",
+    "input_gsd_frame": -1,
 
     "_section_stage":       "--- Stage control ---",
     "stage_id_current":     -1,
     "initial_timestep":     0,
 
     "_section_shape":       "--- Convex-polyhedron shape definition ---",
-    "shape_json_filename":  "shape_048_Elongated_Square_Gyrobicupola_unit_volume_principal_frame.json",
+    "shape_json_filename":  "shape_8500_particle_with_Th_symm_volume_principal_frame.json",
     "shape_scale":          1.0,
 
     "_section_run":         "--- Run lengths ---",
     "_comment_total":       "total_num_timesteps: total HPMC sweeps including equilibration + production",
-    "total_num_timesteps":  50000000,
+    "total_num_timesteps":  100000000,
     "_comment_equil":       "equil_steps: steps reserved for equilibration phase (with tuners active)",
     "equil_steps":          5000000,
     "_comment_check":       "equil_steps_check_freq: chunk size for early-exit equilibration loop. Must divide equil_steps evenly.",
@@ -25,8 +28,8 @@
     "restart_gsd_frequency": 5000,
 
     "_section_mc":          "--- HPMC move parameters ---",
-    "move_size_translation": 0.018,
-    "move_size_rotation":   0.018,
+    "move_size_translation": 0.02,
+    "move_size_rotation":   0.02,
     "_comment_tuner_freq":  "particle_move_size_tuner_freq: MoveSize tuner trigger period (steps)",
     "trans_move_size_tuner_freq": 1000,
     "rot_move_size_tuner_freq": 1000,
@@ -48,9 +51,9 @@
 
     "_section_boxmc_deltas": "--- BoxMC initial move deltas (tuner will adapt these) ---",
     "_comment_len_delta":   "boxmc_length_delta: max length change per independent-length move [sigma]",
-    "boxmc_length_delta":   0.001,
+    "boxmc_length_delta":   0.0018,
     "_comment_shear_delta": "boxmc_shear_delta: max tilt-factor change per shear move",
-    "boxmc_shear_delta":    0.001,
+    "boxmc_shear_delta":    0.0015,
 
     "_section_boxmc_maxmove": "--- BoxMCMoveSize tuner upper bounds ---",
     "max_move_length":      0.01,
@@ -59,7 +62,7 @@
     "_section_sdf":         "--- SDF pressure compute (hoomd.hpmc.compute.SDF) ---",
     "enable_sdf":           true,
     "_comment_sdf2":        "sdf_xmax: upper limit of SDF histogram. 0.02 is suitable for phi < 0.58. Use 0.005 for phi > 0.58.",
-    "sdf_xmax":             0.02,
+    "sdf_xmax":             0.009,
     "_comment_sdf3":        "sdf_dx: histogram bin width. 1e-4 gives ~200 bins for xmax=0.02. Use 1e-5 near close-packing.",
     "sdf_dx":               1.0e-4,
 
@@ -68,10 +71,10 @@
     "gpu_id":               0,
 
     "_section_filenames":   "--- Output filenames (only used when stage_id_current == -1) ---",
-    "output_trajectory":    "HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_output_traj.gsd",
+    "output_trajectory":    "HOOMD_hard_Th_symm_body_4096_hpmc_npt_P70_output_traj.gsd",
     "simulation_log_filename": "npt_hpmc_log.log",
     "box_log_filename":     "box_npt_log.log",
-    "scalar_gsd_log_filename": "HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_scalar_log.gsd",
-    "restart_file":         "HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_restart.gsd",
-    "final_gsd_filename":   "HOOMD_hard_Elongated_Square_Gyrobicupola_4096_hpmc_npt_P70_final.gsd"
+    "scalar_gsd_log_filename": "HOOMD_hard_Th_symm_body_4096_hpmc_npt_P70_scalar_log.gsd",
+    "restart_file":         "HOOMD_hard_Th_symm_body_4096_hpmc_npt_P70_restart.gsd",
+    "final_gsd_filename":   "HOOMD_hard_Th_symm_body_4096_hpmc_npt_P70_final.gsd"
 }

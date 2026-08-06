@@ -246,7 +246,24 @@ def fail_with_context(message: str, **kwargs) -> None:
     lines = [f"[FATAL] {message}"]
     for k, v in kwargs.items():
         lines.append(f"  {k}: {v}")
-    sys.exit("\n".join(lines))
+
+    fatal_text = "\n".join(lines)
+    if _is_root_rank():
+        print(fatal_text, file=sys.stderr, flush=True)
+
+    # sys.exit() terminates only the Python process that calls it.  In an MPI
+    # run, the remaining ranks may stay blocked in a collective operation
+    # (for example comm.bcast), which leaves mpirun and the PBS job alive.
+    # MPI.Abort terminates every rank in the communicator immediately.
+    if _MPI_AVAILABLE:
+        try:
+            comm = MPI.COMM_WORLD
+            if comm.Get_size() > 1:
+                comm.Abort(1)
+        except Exception:
+            pass
+
+    raise SystemExit(1)
 
 
 def debug_kv(title: str, **kwargs) -> None:
@@ -1078,6 +1095,7 @@ class SimulationParams:
     enable_sdf             : bool  = True   Attach SDF pressure compute.
     sdf_xmax               : float = 0.02   SDF histogram upper limit.
     sdf_dx                 : float = 1e-4   SDF histogram bin width.
+    input_gsd_frame       : int   = -1     Input GSD frame index (-1 last, -2 second-last, 0 first).
     initial_timestep       : int   = 0      Starting timestep for fresh runs.
     output_trajectory      : str   = "npt_hpmc_output_traj.gsd"
     simulation_log_filename: str   = "npt_hpmc_log.log"
@@ -1124,6 +1142,9 @@ class SimulationParams:
     pressure:                       float  # target P/(kBT) = betaP
     box_tuner_freq:                 int    # BoxMCMoveSize tuner trigger period
     target_box_movement_acc_rate:   float  # target acceptance for box moves
+
+    # --- Input GSD frame selection (fresh runs only) ---
+    input_gsd_frame:        int    = -1   # -1 last, -2 second-last, 0 first
 
     # BoxMC move deltas
     boxmc_volume_delta:     float  = 0.1         # isotropic volume-change step
@@ -1278,6 +1299,7 @@ _REQUIRED_KEYS: dict[str, type] = {
 }
 
 _OPTIONAL_KEYS: dict[str, type] = {
+    "input_gsd_frame":         int,
     "initial_timestep":         int,
     "output_trajectory":        str,
     "simulation_log_filename":  str,
@@ -1735,9 +1757,17 @@ def load_convex_polyhedron_shape(shape_json_filename: str, shape_scale: float) -
 #  SECTION 8 — MPI snapshot broadcast 
 # ===========================================================================
 
-def load_and_broadcast_snapshot(input_gsd: str, comm, rank: int) -> dict:
+def load_and_broadcast_snapshot(
+    input_gsd: str,
+    frame_index: int,
+    comm,
+    rank: int,
+) -> dict:
     """
-    Rank-0 reads the last GSD frame; broadcasts minimal data to all ranks.
+    Rank 0 reads the requested GSD frame and broadcasts minimal data to all ranks.
+
+    ``frame_index`` follows normal Python/GSD indexing:
+      -1 = last frame, -2 = second-last frame, 0 = first frame, etc.
     """
 
     if rank == 0:
@@ -1750,13 +1780,30 @@ def load_and_broadcast_snapshot(input_gsd: str, comm, rank: int) -> dict:
 
         try:
             with gsd.hoomd.open(name=str(path), mode="r") as f:
-                if len(f) == 0:
+                n_frames = len(f)
+                if n_frames == 0:
                     fail_with_context(
                         "Input GSD contains no frames.",
                         input_gsd=str(path.resolve()),
                     )
-                # f[-1]: read the last (most recent) frame
-                frame = f[-1]
+
+                # Valid Python/GSD indices satisfy:
+                #     -n_frames <= frame_index < n_frames
+                if not (-n_frames <= frame_index < n_frames):
+                    fail_with_context(
+                        "Requested input GSD frame is outside the available range.",
+                        input_gsd=str(path.resolve()),
+                        requested_frame_index=frame_index,
+                        number_of_frames=n_frames,
+                        valid_index_range=f"{-n_frames} to {n_frames - 1}",
+                    )
+
+                # Convert negative indexing ourselves before accessing the GSD.
+                # This works even with GSD versions that do not accept f[-1].
+                actual_frame_index = (
+                    frame_index if frame_index >= 0 else n_frames + frame_index
+                )
+                frame = f[actual_frame_index]
                 box_data  = frame.configuration.box
                 positions = np.asarray(frame.particles.position, dtype=np.float64)
                 orientations = np.asarray(frame.particles.orientation, dtype=np.float64)
@@ -1764,10 +1811,13 @@ def load_and_broadcast_snapshot(input_gsd: str, comm, rank: int) -> dict:
                 types     = list(frame.particles.types)
                 N         = int(len(positions))
 
+        except SystemExit:
+            raise
         except Exception as exc:
             fail_with_context(
-                "Failed while reading the last frame from input GSD.",
+                "Failed while reading the requested frame from input GSD.",
                 input_gsd=str(path.resolve()),
+                requested_frame_index=frame_index,
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
@@ -1777,6 +1827,7 @@ def load_and_broadcast_snapshot(input_gsd: str, comm, rank: int) -> dict:
             fail_with_context(
                 "Particle position array has invalid shape.",
                 input_gsd=str(path.resolve()),
+                requested_frame_index=frame_index,
                 positions_shape=positions.shape,
             )
 
@@ -1784,6 +1835,7 @@ def load_and_broadcast_snapshot(input_gsd: str, comm, rank: int) -> dict:
             fail_with_context(
                 "Particle orientation array has invalid shape.",
                 input_gsd=str(path.resolve()),
+                requested_frame_index=frame_index,
                 orientations_shape=orientations.shape,
             )
 
@@ -1791,6 +1843,7 @@ def load_and_broadcast_snapshot(input_gsd: str, comm, rank: int) -> dict:
             fail_with_context(
                 "Orientation array length does not match number of particles.",
                 input_gsd=str(path.resolve()),
+                requested_frame_index=frame_index,
                 N=N,
                 n_orientations=len(orientations),
             )
@@ -1799,6 +1852,7 @@ def load_and_broadcast_snapshot(input_gsd: str, comm, rank: int) -> dict:
             fail_with_context(
                 "typeid array length does not match number of particles.",
                 input_gsd=str(path.resolve()),
+                requested_frame_index=frame_index,
                 N=N,
                 n_typeid=len(typeid),
             )
@@ -1807,11 +1861,15 @@ def load_and_broadcast_snapshot(input_gsd: str, comm, rank: int) -> dict:
             fail_with_context(
                 "No particle types found in input GSD.",
                 input_gsd=str(path.resolve()),
+                requested_frame_index=frame_index,
             )
 
         debug_kv(
             "Loaded input snapshot",
             input_gsd=str(path.resolve()),
+            requested_frame_index=frame_index,
+            actual_frame_index=actual_frame_index,
+            number_of_frames=n_frames,
             N=N,
             positions_shape=positions.shape,
             orientations_shape=orientations.shape,
@@ -2022,12 +2080,17 @@ def build_simulation(
             )
         root_print(f"[INFO] Fresh run from: '{files.input_gsd}'")
         # Fresh runs use the MPI-safe broadcast pattern:
-        #  1. rank 0 reads the last frame from the input GSD
+        #  1. rank 0 reads the requested frame from the input GSD
         #  2. data dict is broadcast to all MPI ranks
         #  3. all ranks reconstruct an identical hoomd.Snapshot
         #  4. HOOMD distributes particles into MPI domains internally
         try:
-            snap_data = load_and_broadcast_snapshot(files.input_gsd, comm, rank)
+            snap_data = load_and_broadcast_snapshot(
+                files.input_gsd,
+                params.input_gsd_frame,
+                comm,
+                rank,
+            )
             snapshot  = reconstruct_snapshot(snap_data, rank)
             sim.create_state_from_snapshot(snapshot)
         except SystemExit:
@@ -2819,6 +2882,7 @@ def write_final_outputs(
         "stage_id":          params.stage_id_current,
         "simulparam_file":   json_path,
         "input_gsd":         files.input_gsd,
+        "input_gsd_frame":   params.input_gsd_frame,
         "final_gsd":         files.final_gsd,
         "n_particles":       N,
         "shape_json_filename": params.shape_json_filename,
@@ -2927,6 +2991,7 @@ def main() -> None:
     root_print(f"[INFO] Loaded parameters from '{args.simulparam_file}'")
     root_print(f"  tag                 = {params.tag}")
     root_print(f"  stage_id_current    = {params.stage_id_current}")
+    root_print(f"  input_gsd_frame     = {params.input_gsd_frame}")
     root_print(f"  total_num_timesteps = {params.total_num_timesteps}")
     root_print(f"  equil_steps         = {params.equil_steps}")
     root_print(f"  pressure (betaP)    = {params.pressure}")
@@ -2956,6 +3021,7 @@ def main() -> None:
         stage_id=params.stage_id_current,
         tag=params.tag,
         input_gsd=files.input_gsd,
+        input_gsd_frame=params.input_gsd_frame,
         traj_gsd=files.traj_gsd,
         restart_gsd=files.restart_gsd,
         final_gsd=files.final_gsd,
