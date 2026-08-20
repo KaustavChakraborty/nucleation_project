@@ -1,0 +1,63 @@
+{
+    "0_Id": "23",
+    "1_Name": "Cube",
+    "2_ShortName": "P03",
+    "3_Comment": "Vertices are in principal frame,centered, and correspond to unit volume",
+    "4_volume": 1.0,
+    "5_center_of_mass": [
+        0.0,
+        0.0,
+        0.0
+    ],
+    "6_moment_of_inertia": [
+        0.16666666666666666,
+        -0.0,
+        -0.0,
+        0.16666666666666666,
+        -0.0,
+        0.16666666666666666
+    ],
+    "7_comment_about_moment_of_inertia": "The components are stored as xx, xy, xz, yy, yz, zz",
+    "8_vertices": [
+        [
+            -0.5,
+            -0.5,
+            -0.5
+        ],
+        [
+            -0.5,
+            -0.5,
+            0.5
+        ],
+        [
+            -0.5,
+            0.5,
+            -0.5
+        ],
+        [
+            -0.5,
+            0.5,
+            0.5
+        ],
+        [
+            0.5,
+            -0.5,
+            -0.5
+        ],
+        [
+            0.5,
+            -0.5,
+            0.5
+        ],
+        [
+            0.5,
+            0.5,
+            -0.5
+        ],
+        [
+            0.5,
+            0.5,
+            0.5
+        ]
+    ]
+}
