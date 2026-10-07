@@ -1,0 +1,68 @@
+{
+    "gsd_file": "hpmc_hard_Elongated_Pentagonal_Dipyramid_vol_1p00_4096_NPT_P150_0_traj.gsd",
+    "shape_file": "shape_037_Elongated_Pentagonal_Dipyramid_unit_volume_principal_frame.json",
+    "frame_index": -1,
+    "orientation_angle_tol": 45.0,
+    "cluster_size_cutoff": 200,
+    "cmap_original": [
+        "#0080ff",
+        "#ff8000",
+        "#5b0aa2",
+        "#db023c",
+        "#00ffff"
+    ],
+    "tolerance_for_inv_quat_of_body_calc": 2,
+    "pairwise_block_size": 256,
+    "pairwise_matrix_ram_limit_mb": 512,
+    "output_dir": "outputs_orientational_snapshot",
+    "output_prefix": "EPD",
+    "render": {
+        "camera_euler_zyx_deg": [
+            0.0,
+            10.0,
+            10.0
+        ],
+        "full_scene_size": null,
+        "full_padding_factor": 1.05,
+        "full_pixel_scale": 100,
+        "zoom_scene_size": null,
+        "zoom_padding_factor": 1.32,
+        "zoom_pixel_scale": 180,
+        "outline": 0.01,
+        "roughness": 0.15,
+        "specular": 0.8,
+        "spec_trans": 0.0,
+        "ambient_light": 1.5,
+        "directional_light": [
+            -1.5,
+            0.0,
+            0.0
+        ],
+        "antialiasing": 1.0,
+        "pathtrace_samples": 128,
+        "show_box": true,
+        "show_zoom_box": false,
+        "box_width": 0.04,
+        "box_color_rgba": [
+            0.1,
+            0.1,
+            0.1,
+            1.0
+        ]
+    },
+    "zoom": {
+        "enabled": true,
+        "center_fractional": [
+            0.0,
+            0.0,
+            0.0
+        ],
+        "center_particle_index": null,
+        "size_fractional": [
+            0.3,
+            0.3,
+            0.3
+        ],
+        "cluster_ids": null
+    }
+}
